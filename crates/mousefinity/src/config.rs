@@ -30,6 +30,9 @@ pub struct Config {
     /// Screen arrangement: for each host name, which host lies past each edge.
     #[serde(default)]
     pub layout: BTreeMap<String, Neighbors>,
+    /// Revision of `layout` (unix ms of the last edit); drives layout sync.
+    #[serde(default)]
+    pub layout_rev: u64,
 }
 
 impl Config {
@@ -75,6 +78,25 @@ pub fn load() -> Result<Config> {
         bail!("config `name` must not be empty");
     }
     Ok(cfg)
+}
+
+/// Milliseconds since the Unix epoch; used as the layout revision.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Persist a layout adopted from a peer, unless the on-disk copy is newer.
+pub fn save_synced_layout(rev: u64, layout: &Layout) -> Result<()> {
+    let mut cfg = load()?;
+    if cfg.layout_rev >= rev {
+        return Ok(());
+    }
+    cfg.layout_rev = rev;
+    cfg.layout = layout.0.clone();
+    save(&cfg)
 }
 
 pub fn save(cfg: &Config) -> Result<()> {

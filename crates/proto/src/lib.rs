@@ -181,6 +181,11 @@ pub enum Msg {
     Clipboard { text: String },
     /// Screen size changed (e.g. resolution switch).
     Screen { screen: (u32, u32) },
+    /// Layout sync: the sender's screen arrangement and its revision
+    /// (milliseconds since the Unix epoch of the last local edit). Receivers
+    /// adopt strictly newer revisions, persist them, and gossip them onward,
+    /// so a `link`/TUI edit on any machine reaches every connected peer.
+    Layout { rev: u64, layout: Layout },
 }
 
 /// Header for a file transfer connection (`ALPN_FILE`). Sent framed, then the
@@ -233,8 +238,28 @@ pub enum Edge {
     Down,
 }
 
+impl Edge {
+    pub fn opposite(self) -> Edge {
+        match self {
+            Edge::Left => Edge::Right,
+            Edge::Right => Edge::Left,
+            Edge::Up => Edge::Down,
+            Edge::Down => Edge::Up,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Edge::Left => "left",
+            Edge::Right => "right",
+            Edge::Up => "up",
+            Edge::Down => "down",
+        }
+    }
+}
+
 /// Neighbours of one screen in the virtual arrangement.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Neighbors {
     pub left: Option<String>,
     pub right: Option<String>,
@@ -251,10 +276,23 @@ impl Neighbors {
             Edge::Down => self.down.as_deref(),
         }
     }
+
+    pub fn get_mut(&mut self, edge: Edge) -> &mut Option<String> {
+        match edge {
+            Edge::Left => &mut self.left,
+            Edge::Right => &mut self.right,
+            Edge::Up => &mut self.up,
+            Edge::Down => &mut self.down,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.left.is_none() && self.right.is_none() && self.up.is_none() && self.down.is_none()
+    }
 }
 
 /// The virtual arrangement of screens, keyed by host name.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Layout(pub std::collections::BTreeMap<String, Neighbors>);
 
 impl Layout {

@@ -2,10 +2,10 @@
 //! relay fallback. Peers are trusted purely by their public key (EndpointId);
 //! anything else is refused at accept time.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -25,11 +25,29 @@ pub struct Net {
     pub endpoint: Endpoint,
     my_name: String,
     my_screen: (u32, u32),
-    peers_by_name: HashMap<String, EndpointId>,
-    names_by_id: HashMap<EndpointId, String>,
+    peers_by_name: RwLock<HashMap<String, EndpointId>>,
+    names_by_id: RwLock<HashMap<EndpointId, String>>,
+    /// Peer names that currently have a live dial task.
+    dialing: Mutex<HashSet<String>>,
     engine_tx: UnboundedSender<EngineIn>,
     epoch: AtomicU64,
     downloads: PathBuf,
+}
+
+fn parse_peers(
+    cfg: &Config,
+) -> Result<(HashMap<String, EndpointId>, HashMap<EndpointId, String>)> {
+    let mut by_name = HashMap::new();
+    let mut by_id = HashMap::new();
+    for (name, peer) in &cfg.peers {
+        let id: EndpointId = peer
+            .id
+            .parse()
+            .with_context(|| format!("peer `{name}` has an invalid id"))?;
+        by_name.insert(name.clone(), id);
+        by_id.insert(id, name.clone());
+    }
+    Ok((by_name, by_id))
 }
 
 impl Net {
@@ -39,16 +57,7 @@ impl Net {
         my_screen: (u32, u32),
         engine_tx: UnboundedSender<EngineIn>,
     ) -> Result<Arc<Self>> {
-        let mut peers_by_name = HashMap::new();
-        let mut names_by_id = HashMap::new();
-        for (name, peer) in &cfg.peers {
-            let id: EndpointId = peer
-                .id
-                .parse()
-                .with_context(|| format!("peer `{name}` has an invalid id"))?;
-            peers_by_name.insert(name.clone(), id);
-            names_by_id.insert(id, name.clone());
-        }
+        let (peers_by_name, names_by_id) = parse_peers(cfg)?;
         let endpoint = Endpoint::builder(presets::N0)
             .secret_key(SecretKey::from_bytes(&secret))
             .alpns(vec![ALPN_CONTROL.to_vec(), ALPN_FILE.to_vec()])
@@ -63,8 +72,9 @@ impl Net {
             endpoint,
             my_name: cfg.name.clone(),
             my_screen,
-            peers_by_name,
-            names_by_id,
+            peers_by_name: RwLock::new(peers_by_name),
+            names_by_id: RwLock::new(names_by_id),
+            dialing: Mutex::new(HashSet::new()),
             engine_tx,
             epoch: AtomicU64::new(0),
             downloads: cfg.downloads_dir(),
@@ -75,17 +85,48 @@ impl Net {
         self.endpoint.id()
     }
 
-    /// Spawn dial loops and run the accept loop forever.
-    pub async fn run(self: Arc<Self>) {
-        // Between any pair exactly one side dials (the lexicographically
-        // smaller id), so a pair never races to create duplicate links.
+    /// Re-read the config: refresh the trusted-peer maps, start dialing any
+    /// newly added peers, and hand the (possibly newer) layout to the engine.
+    pub fn reload(self: &Arc<Self>) -> Result<String> {
+        let cfg = crate::config::load()?;
+        let (by_name, by_id) = parse_peers(&cfg)?;
+        let n = by_name.len();
+        *self.peers_by_name.write().unwrap() = by_name;
+        *self.names_by_id.write().unwrap() = by_id;
+        self.spawn_dials();
+        let _ = self.engine_tx.send(EngineIn::SetLayout {
+            rev: cfg.layout_rev,
+            layout: cfg.layout(),
+        });
+        Ok(format!("reloaded: {n} peer(s), layout rev {}", cfg.layout_rev))
+    }
+
+    /// Start a dial task for every trusted peer that we are responsible for
+    /// dialing and that doesn't have one yet. Between any pair exactly one
+    /// side dials (the lexicographically smaller id), so a pair never races
+    /// to create duplicate links.
+    fn spawn_dials(self: &Arc<Self>) {
         let my_id = self.endpoint.id();
-        for (name, id) in self.peers_by_name.clone() {
-            if my_id.as_bytes() < id.as_bytes() {
+        let snapshot: Vec<(String, EndpointId)> = self
+            .peers_by_name
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(n, i)| (n.clone(), *i))
+            .collect();
+        for (name, id) in snapshot {
+            if my_id.as_bytes() < id.as_bytes()
+                && self.dialing.lock().unwrap().insert(name.clone())
+            {
                 let net = self.clone();
-                tokio::spawn(async move { net.dial_loop(name, id).await });
+                tokio::spawn(async move { net.dial_loop(name).await });
             }
         }
+    }
+
+    /// Run the dial loops and the accept loop forever.
+    pub async fn run(self: Arc<Self>) {
+        self.spawn_dials();
         while let Some(incoming) = self.endpoint.accept().await {
             let net = self.clone();
             tokio::spawn(async move {
@@ -97,7 +138,8 @@ impl Net {
                     }
                 };
                 let id = conn.remote_id();
-                let Some(name) = net.names_by_id.get(&id).cloned() else {
+                let name = net.names_by_id.read().unwrap().get(&id).cloned();
+                let Some(name) = name else {
                     warn!("rejecting connection from unknown endpoint {id}");
                     conn.close(1u32.into(), b"not paired");
                     return;
@@ -122,8 +164,14 @@ impl Net {
         }
     }
 
-    async fn dial_loop(self: Arc<Self>, name: String, id: EndpointId) {
+    async fn dial_loop(self: Arc<Self>, name: String) {
         loop {
+            // Re-resolve each round so a reload can retarget or retire us.
+            let id = self.peers_by_name.read().unwrap().get(&name).copied();
+            let Some(id) = id else { break };
+            if self.endpoint.id().as_bytes() >= id.as_bytes() {
+                break; // after a re-pair the other side dials now
+            }
             match self.endpoint.connect(id, ALPN_CONTROL).await {
                 Ok(conn) => {
                     info!("connected to {name}");
@@ -138,6 +186,7 @@ impl Net {
             }
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
+        self.dialing.lock().unwrap().remove(&name);
     }
 
     /// Run one control link: hello exchange, then pump messages both ways
@@ -212,9 +261,12 @@ impl Net {
     // ---- file transfer ----
 
     pub async fn send_file(&self, peer: &str, path: &Path) -> Result<String> {
-        let id = *self
+        let id = self
             .peers_by_name
+            .read()
+            .unwrap()
             .get(peer)
+            .copied()
             .with_context(|| format!("unknown peer `{peer}`"))?;
         let meta = tokio::fs::metadata(path)
             .await

@@ -23,6 +23,7 @@ data-encoding = "2.11.0"
 rand = "0.10.2"
 serde_json = "1.0.150"
 iroh-mdns-address-lookup = "0.4.0"
+ratatui = "0.30.2"
 
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_UI_HiDpi"] }

@@ -40,6 +40,8 @@ pub enum EngineIn {
     },
     PeerMsg { name: String, msg: Msg },
     PeerDown { name: String, epoch: u64 },
+    /// The config on disk changed (IPC reload): adopt if newer and gossip.
+    SetLayout { rev: u64, layout: Layout },
 }
 
 struct Peer {
@@ -57,6 +59,7 @@ pub struct Engine {
     my_name: String,
     my_screen: (u32, u32),
     layout: Layout,
+    layout_rev: u64,
     peers: HashMap<String, Peer>,
     focus: Focus,
     controlled_by: Option<String>,
@@ -70,6 +73,7 @@ impl Engine {
         my_name: String,
         my_screen: (u32, u32),
         layout: Layout,
+        layout_rev: u64,
         shared: Arc<CaptureShared>,
         inject: UnboundedSender<InjectCmd>,
     ) -> Self {
@@ -77,6 +81,7 @@ impl Engine {
             my_name,
             my_screen,
             layout,
+            layout_rev,
             peers: HashMap::new(),
             focus: Focus::Local,
             controlled_by: None,
@@ -103,6 +108,11 @@ impl Engine {
                 tx,
             } => {
                 info!("peer up: {name} ({}x{})", screen.0, screen.1);
+                // Offer our layout; whichever side has the newer revision wins.
+                let _ = tx.send(Msg::Layout {
+                    rev: self.layout_rev,
+                    layout: self.layout.clone(),
+                });
                 self.peers.insert(name, Peer { screen, epoch, tx });
             }
             EngineIn::PeerDown { name, epoch } => {
@@ -125,6 +135,32 @@ impl Engine {
                 }
             }
             EngineIn::PeerMsg { name, msg } => self.on_peer(name, msg),
+            EngineIn::SetLayout { rev, layout } => self.adopt_layout(rev, layout, None),
+        }
+    }
+
+    /// Adopt a layout if its revision is strictly newer than ours, persist it,
+    /// and gossip it to every peer except where it came from. Echoes carry an
+    /// equal revision and stop here, so gossip converges.
+    fn adopt_layout(&mut self, rev: u64, layout: Layout, source: Option<&str>) {
+        if rev <= self.layout_rev {
+            return;
+        }
+        info!("adopting layout rev {rev} from {}", source.unwrap_or("disk"));
+        self.layout_rev = rev;
+        self.layout = layout.clone();
+        if source.is_some() {
+            if let Err(e) = crate::config::save_synced_layout(rev, &layout) {
+                warn!("could not persist synced layout: {e:#}");
+            }
+        }
+        for (name, peer) in &self.peers {
+            if Some(name.as_str()) != source {
+                let _ = peer.tx.send(Msg::Layout {
+                    rev,
+                    layout: layout.clone(),
+                });
+            }
         }
     }
 
@@ -343,6 +379,7 @@ impl Engine {
                     p.screen = screen;
                 }
             }
+            Msg::Layout { rev, layout } => self.adopt_layout(rev, layout, Some(&name)),
             Msg::Hello { .. } => {}
         }
     }
@@ -385,6 +422,7 @@ mod tests {
             "a".into(),
             (1000, 1000),
             Layout(layout_map),
+            1,
             shared.clone(),
             inject_tx,
         );
@@ -397,12 +435,18 @@ mod tests {
             tx: peer_tx,
         })
         .unwrap();
-        Rig {
+        let mut rig = Rig {
             tx,
             inject_rx,
             peer_rx,
             shared,
+        };
+        // Drain the layout offer that PeerUp always sends.
+        match recv(&mut rig.peer_rx) {
+            Msg::Layout { .. } => {}
+            other => panic!("expected initial Layout offer, got {other:?}"),
         }
+        rig
     }
 
     fn recv<T>(rx: &mut UnboundedReceiver<T>) -> T {

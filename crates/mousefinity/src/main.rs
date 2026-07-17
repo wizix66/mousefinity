@@ -6,6 +6,7 @@ mod inject;
 mod ipc;
 mod keymap;
 mod net;
+mod tui;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -46,6 +47,8 @@ enum Cmd {
         edge: String,
         b: String,
     },
+    /// Interactive configuration UI (peers, layout, pairing).
+    Tui,
     /// Run the daemon (input sharing, clipboard sync, file receiving).
     Run,
     /// Send files to a peer via the running daemon.
@@ -78,6 +81,7 @@ fn main() -> Result<()> {
         Cmd::Id => cmd_id(),
         Cmd::AddPeer { name, id } => cmd_add_peer(name, id),
         Cmd::Link { a, edge, b } => cmd_link(a, edge, b),
+        Cmd::Tui => tui::run(),
         Cmd::Run => cmd_run(),
         Cmd::Send { peer, files } => ipc::client_send(&peer, &files),
     }
@@ -106,6 +110,7 @@ fn cmd_init(name: Option<String>) -> Result<()> {
             downloads: None,
             peers: Default::default(),
             layout: Default::default(),
+            layout_rev: 0,
         };
         config::save(&cfg)?;
         println!("wrote {}", config::config_path()?.display());
@@ -156,8 +161,15 @@ fn cmd_link(a: String, edge: String, b: String) -> Result<()> {
         };
     *fwd(cfg.layout.entry(a.clone()).or_default()) = Some(b.clone());
     *back(cfg.layout.entry(b.clone()).or_default()) = Some(a.clone());
+    cfg.layout_rev = config::now_ms();
     config::save(&cfg)?;
     println!("linked: leaving `{a}` {edge} lands on `{b}`");
+    // If a daemon is running, it picks the change up and syncs it to every
+    // connected peer; otherwise the sync happens on the next `run`.
+    match ipc::client_reload() {
+        Ok(_) => println!("daemon reloaded — layout is syncing to connected peers"),
+        Err(_) => println!("no running daemon — layout will sync when the daemon starts"),
+    }
     Ok(())
 }
 
@@ -173,10 +185,15 @@ fn cmd_run() -> Result<()> {
         })
         .context("cannot detect screen size; set `screen = [width, height]` in the config")?;
     info!("host `{}`, screen {}x{}", cfg.name, screen.0, screen.1);
+    // Synced layouts may legitimately mention screens this host has not
+    // paired with (yet); such edges simply never trigger a hop here.
     for (screen_name, n) in &cfg.layout {
         for neighbor in [&n.left, &n.right, &n.up, &n.down].into_iter().flatten() {
             if neighbor != &cfg.name && !cfg.peers.contains_key(neighbor) {
-                bail!("layout references `{neighbor}` (from `{screen_name}`) but it is not a peer");
+                tracing::warn!(
+                    "layout references `{neighbor}` (from `{screen_name}`) but it is not a \
+                     paired peer on this host"
+                );
             }
         }
     }
@@ -189,6 +206,7 @@ fn cmd_run() -> Result<()> {
         cfg.name.clone(),
         screen,
         cfg.layout(),
+        cfg.layout_rev,
         shared.clone(),
         inject_tx,
     );

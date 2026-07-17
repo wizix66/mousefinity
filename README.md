@@ -35,6 +35,10 @@ computer. You decide how the screens are arranged.
 
 ## Install
 
+Grab a prebuilt binary from the
+[releases page](https://github.com/wizix66/mousefinity/releases)
+(Windows, Linux, macOS Intel + Apple Silicon), or build from source:
+
 ```sh
 cargo build --release          # produces target/release/mousefinity(.exe)
 ```
@@ -55,12 +59,22 @@ Exchange the printed pairing ids (they are public keys — safe to share):
 ```sh
 # on desktop
 mousefinity add-peer laptop  <laptop's id>
-mousefinity link desktop right laptop     # laptop sits to the right
-
 # on laptop
 mousefinity add-peer desktop <desktop's id>
-mousefinity link laptop left desktop      # mirror of the above
 ```
+
+Arrange the screens **on either machine** (the layout syncs to every
+connected peer automatically — newest edit wins):
+
+```sh
+mousefinity link desktop right laptop     # laptop sits to the right
+```
+
+Prefer something friendlier? `mousefinity tui` opens an interactive
+configuration UI: add/remove peers (Ctrl-V pastes a pairing id), copy your
+own id, and set each screen's neighbours with the arrow keys. Saving pokes a
+running daemon so changes apply — and sync — immediately, no restart needed
+for layout edits.
 
 Then start the daemon on both:
 
@@ -103,6 +117,12 @@ The layout is a graph, not a grid — chain as many machines as you like
 (`desktop → laptop → mac`), including vertical stacking with `up`/`down`.
 Hops work between any two machines that are direct neighbours in the layout;
 each machine only needs a peering entry for machines it talks to directly.
+
+**Layout syncs itself.** Every edit (via `link` or the TUI) stamps a
+revision; peers exchange layouts when they connect and gossip newer
+revisions onward, so you only ever edit the arrangement on one machine.
+Trust does *not* sync, by design: each machine decides for itself which
+public keys it accepts, so `add-peer` stays a per-machine step.
 
 The identity key lives next to the config (`secret.key`). Protect it like an
 SSH private key; the pairing id printed by `init`/`id` is the public half.
@@ -162,6 +182,9 @@ system-wide input on stock iOS.
 
 ## Limitations (v0.1)
 
+- Layout edits sync between connected daemons; a machine that was offline
+  catches up when it reconnects. If two people edit layouts simultaneously
+  on different machines, the newest timestamp wins.
 - Clipboard is text-only; images/rich content planned.
 - Key forwarding assumes a US-QWERTY *sender* for printable characters
   (named keys — arrows, modifiers, function keys — are layout-independent).

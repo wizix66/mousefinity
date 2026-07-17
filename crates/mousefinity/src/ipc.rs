@@ -92,6 +92,17 @@ async fn handle(stream: tokio::net::TcpStream, net: Arc<Net>, token: &str) -> Re
                 message: format!("{e:#}"),
             },
         }
+    } else if req.cmd == "reload" {
+        match net.reload() {
+            Ok(m) => Response {
+                ok: true,
+                message: m,
+            },
+            Err(e) => Response {
+                ok: false,
+                message: format!("{e:#}"),
+            },
+        }
     } else {
         Response {
             ok: false,
@@ -104,30 +115,46 @@ async fn handle(stream: tokio::net::TcpStream, net: Arc<Net>, token: &str) -> Re
     Ok(())
 }
 
-/// CLI side: ask the running daemon to send files. Blocking/synchronous.
-pub fn client_send(peer: &str, files: &[PathBuf]) -> Result<()> {
+/// Send one request to the local daemon; the token is filled in from the
+/// info file the daemon wrote at startup.
+fn client_request(cmd: &str, peer: &str, path: &str) -> Result<Response> {
     let raw = std::fs::read(info_path()?)
         .context("cannot read ipc info — is `mousefinity run` active on this machine?")?;
     let info: IpcInfo = serde_json::from_slice(&raw).context("corrupt ipc info")?;
+    let req = Request {
+        token: info.token,
+        cmd: cmd.to_string(),
+        peer: peer.to_string(),
+        path: path.to_string(),
+    };
+    let stream = std::net::TcpStream::connect(("127.0.0.1", info.port))
+        .context("daemon not reachable — is `mousefinity run` active?")?;
+    let mut w = stream.try_clone()?;
+    let mut line = serde_json::to_vec(&req)?;
+    line.push(b'\n');
+    w.write_all(&line)?;
+    let mut reader = BufReader::new(stream);
+    let mut resp_line = String::new();
+    reader.read_line(&mut resp_line)?;
+    serde_json::from_str(resp_line.trim()).context("daemon returned an unreadable response")
+}
+
+/// Tell a running daemon to re-read its config. Returns its status message.
+pub fn client_reload() -> Result<String> {
+    let resp = client_request("reload", "", "")?;
+    if resp.ok {
+        Ok(resp.message)
+    } else {
+        anyhow::bail!("{}", resp.message)
+    }
+}
+
+/// CLI side: ask the running daemon to send files. Blocking/synchronous.
+pub fn client_send(peer: &str, files: &[PathBuf]) -> Result<()> {
     for f in files {
-        let abs = std::fs::canonicalize(f).with_context(|| format!("no such file: {}", f.display()))?;
-        let stream = std::net::TcpStream::connect(("127.0.0.1", info.port))
-            .context("daemon not reachable — is `mousefinity run` active?")?;
-        let req = Request {
-            token: info.token.clone(),
-            cmd: "send".into(),
-            peer: peer.to_string(),
-            path: abs.to_string_lossy().into_owned(),
-        };
-        let mut w = stream.try_clone()?;
-        let mut line = serde_json::to_vec(&req)?;
-        line.push(b'\n');
-        w.write_all(&line)?;
-        let mut reader = BufReader::new(stream);
-        let mut resp_line = String::new();
-        reader.read_line(&mut resp_line)?;
-        let resp: Response = serde_json::from_str(resp_line.trim())
-            .context("daemon returned an unreadable response")?;
+        let abs =
+            std::fs::canonicalize(f).with_context(|| format!("no such file: {}", f.display()))?;
+        let resp = client_request("send", peer, &abs.to_string_lossy())?;
         if resp.ok {
             println!("{}", resp.message);
         } else {
