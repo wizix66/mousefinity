@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["crates/proto", "crates/mousefinity"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/wizix66/mousefinity"
+
+[profile.release]
+lto = "thin"
+strip = true
+
+# Optimize dependencies even in dev builds. Besides speed, this keeps the
+# iroh-relay cdylib's export table under the 64k limit of the windows-gnu
+# linker (unoptimized it overflows with "export ordinal too large").
+[profile.dev.package."*"]
+opt-level = 2

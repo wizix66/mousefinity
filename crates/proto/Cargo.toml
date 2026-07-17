@@ -1,0 +1,12 @@
+[package]
+name = "mousefinity-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Wire protocol and screen-layout model for mousefinity"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+tokio = { version = "1", features = ["io-util"] }
+thiserror = "2"
