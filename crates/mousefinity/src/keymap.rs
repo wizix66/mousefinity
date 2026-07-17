@@ -92,15 +92,18 @@ pub fn enigo_key(k: Key) -> Option<enigo::Key> {
         Key::Space => E::Space,
         Key::Tab => E::Tab,
         Key::UpArrow => E::UpArrow,
-        Key::PrintScreen => E::PrintScr,
-        Key::Insert => E::Insert,
         Key::KpDelete => E::Delete,
+        #[cfg(any(target_os = "windows", all(unix, not(target_os = "macos"))))]
+        Key::PrintScreen => E::PrintScr,
+        #[cfg(any(target_os = "windows", all(unix, not(target_os = "macos"))))]
+        Key::Insert => E::Insert,
         #[cfg(any(target_os = "windows", all(unix, not(target_os = "macos"))))]
         Key::NumLock => E::Numlock,
         #[cfg(any(target_os = "windows", all(unix, not(target_os = "macos"))))]
         Key::Pause => E::Pause,
+        // These keys don't exist in enigo's macOS backend.
         #[cfg(target_os = "macos")]
-        Key::NumLock | Key::Pause => return None,
+        Key::NumLock | Key::Pause | Key::PrintScreen | Key::Insert => return None,
         // ScrollLock is the local emergency-release hotkey; never injected.
         Key::ScrollLock | Key::Function | Key::Unknown(_) => return None,
         Key::KeyA => return ch('a'),
