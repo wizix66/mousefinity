@@ -37,6 +37,8 @@ jobs:
           sudo apt-get install -y libx11-dev libxtst-dev libxi-dev libevdev-dev libxdo-dev
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --target ${{ matrix.target }} -p mousefinity
+      - name: Build relay server (iroh-relay)
+        run: cargo install iroh-relay@1.0.2 --features server --target ${{ matrix.target }} --root relay-stage
       - name: Package (unix)
         if: runner.os != 'Windows'
         run: |
@@ -44,6 +46,10 @@ jobs:
           mkdir "$staging"
           cp target/${{ matrix.target }}/release/mousefinity README.md LICENSE-MIT LICENSE-APACHE "$staging/"
           tar czf "$staging.tar.gz" "$staging"
+          relaystaging=mousefinity-relay-${{ github.ref_name }}-${{ matrix.target }}
+          mkdir "$relaystaging"
+          cp relay-stage/bin/iroh-relay relay/relay.example.toml relay/iroh-relay.service README.md "$relaystaging/"
+          tar czf "$relaystaging.tar.gz" "$relaystaging"
       - name: Package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -52,10 +58,16 @@ jobs:
           New-Item -ItemType Directory $staging | Out-Null
           Copy-Item target/${{ matrix.target }}/release/mousefinity.exe, README.md, LICENSE-MIT, LICENSE-APACHE $staging/
           Compress-Archive -Path $staging -DestinationPath "$staging.zip"
+          $relayStaging = "mousefinity-relay-${{ github.ref_name }}-${{ matrix.target }}"
+          New-Item -ItemType Directory $relayStaging | Out-Null
+          Copy-Item relay-stage/bin/iroh-relay.exe, relay/relay.example.toml, README.md $relayStaging/
+          Compress-Archive -Path $relayStaging -DestinationPath "$relayStaging.zip"
       - uses: actions/upload-artifact@v4
         with:
           name: mousefinity-${{ matrix.target }}
-          path: mousefinity-${{ github.ref_name }}-${{ matrix.target }}.*
+          path: |
+            mousefinity-${{ github.ref_name }}-${{ matrix.target }}.*
+            mousefinity-relay-${{ github.ref_name }}-${{ matrix.target }}.*
           if-no-files-found: error
 
   release:

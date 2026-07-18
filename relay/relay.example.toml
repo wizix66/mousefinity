@@ -1,0 +1,42 @@
+# iroh-relay server configuration for mousefinity self-hosting.
+# Run with:  iroh-relay --config-path /etc/iroh-relay/config.toml
+# Docs for every field: https://docs.rs/crate/iroh-relay (main.rs Config)
+
+enable_relay = true
+
+# Plain-HTTP listener. Port 80 is also used for LetsEncrypt HTTP-01
+# challenges, so keep it reachable from the internet when using LetsEncrypt.
+# ("[::]" is dual-stack on Linux; on Windows it binds IPv6 only — use
+# "0.0.0.0:80" there if you must serve IPv4.)
+http_bind_addr = "[::]:80"
+
+# QUIC address discovery: lets clients learn their public address, which
+# improves hole-punching into direct connections. Requires TLS.
+# Uses UDP port 7842 (open it in the server firewall).
+enable_quic_addr_discovery = true
+
+# Prometheus metrics on [::]:9090 by default; disable or firewall it.
+enable_metrics = false
+
+[tls]
+https_bind_addr = "[::]:443"
+cert_mode = "LetsEncrypt"           # or "Manual" (see below)
+hostname = ["relay.example.com"]    # must resolve to this server
+contact = "you@example.com"         # LetsEncrypt account email
+cert_dir = "/var/lib/iroh-relay/certs"
+
+# For cert_mode = "Manual" (own certs / behind your own automation):
+# manual_cert_path = "/etc/iroh-relay/tls/fullchain.pem"
+# manual_key_path  = "/etc/iroh-relay/tls/privkey.pem"
+
+# --- Access control (recommended) ---------------------------------------
+# Without this, anyone who can reach the relay may use it to carry their
+# own iroh traffic (they can never read or join *your* mousefinity mesh —
+# peers authenticate each other by key — but they'd consume your bandwidth).
+#
+# Allow only your own machines; the ids come from `mousefinity id`:
+#
+# access.allowlist = [
+#   "b754aef2f91ad8e2d1499473b7ecef4e603e7f5bfbc3640828276c456e3ebbff",
+#   "ef02a87a11cb76c9da319bc3474a0e31e289b66ed32016753e9b857e28cb98a6",
+# ]
