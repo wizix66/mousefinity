@@ -2,7 +2,7 @@
 //! relay fallback. Peers are trusted purely by their public key (EndpointId);
 //! anything else is refused at accept time.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -12,8 +12,8 @@ use anyhow::{bail, Context, Result};
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use mousefinity_proto::{
-    read_frame, write_frame, FileOffer, JoinRequest, JoinResponse, Member, Msg, ALPN_CONTROL,
-    ALPN_FILE, ALPN_JOIN, PROTO_VERSION,
+    read_frame, write_frame, Edge, FileOffer, JoinRequest, JoinResponse, Layout, Member, Msg,
+    Neighbors, ALPN_CONTROL, ALPN_FILE, ALPN_JOIN, PROTO_VERSION,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::{self, UnboundedSender};
@@ -72,6 +72,27 @@ fn parse_peers(cfg: &Config) -> Result<PeerMaps> {
         }
     }
     Ok((by_name, by_id, statics))
+}
+
+/// Rewrite every screen key and neighbour reference through `f`.
+///
+/// References that do not resolve are dropped: a name that means nothing
+/// outside this host would only add a phantom screen on the other side.
+fn map_layout(layout: &Layout, f: impl Fn(&str) -> Option<String>) -> Layout {
+    let mut out = BTreeMap::new();
+    for (screen, neighbors) in &layout.0 {
+        let Some(key) = f(screen) else { continue };
+        let mut mapped = Neighbors::default();
+        for edge in [Edge::Left, Edge::Right, Edge::Up, Edge::Down] {
+            if let Some(target) = neighbors.get(edge) {
+                *mapped.get_mut(edge) = f(target);
+            }
+        }
+        if !mapped.is_empty() {
+            out.insert(key, mapped);
+        }
+    }
+    Layout(out)
 }
 
 /// Build and bind the iroh endpoint per the config's network policy.
@@ -358,6 +379,14 @@ impl Net {
 
         let write_loop = async {
             while let Some(msg) = rx.recv().await {
+                // The engine speaks local names; the wire speaks ids.
+                let msg = match msg {
+                    Msg::Layout { rev, layout } => Msg::Layout {
+                        rev,
+                        layout: self.layout_to_wire(&layout),
+                    },
+                    other => other,
+                };
                 write_frame(&mut send, &msg).await?;
             }
             Ok::<_, anyhow::Error>(())
@@ -376,6 +405,17 @@ impl Net {
                                 warn!("roster merge failed: {e:#}");
                             }
                         }
+                    }
+                    // Ids on the wire become whatever this host calls those
+                    // machines, so a peer's naming never leaks into ours.
+                    Msg::Layout { rev, layout } => {
+                        let _ = engine_tx.send(EngineIn::PeerMsg {
+                            name: peer_name.clone(),
+                            msg: Msg::Layout {
+                                rev,
+                                layout: net.layout_from_wire(&layout),
+                            },
+                        });
                     }
                     msg => {
                         let _ = engine_tx.send(EngineIn::PeerMsg {
@@ -400,6 +440,47 @@ impl Net {
         }
         let _ = self.engine_tx.send(EngineIn::PeerDown { name, epoch });
         result
+    }
+
+    // ---- layout translation ----
+
+    /// Local names -> endpoint ids, for a layout about to go on the wire.
+    ///
+    /// Ids already in the layout (machines this host never named) pass through
+    /// untouched, so gossiping through a host that has not paired with every
+    /// machine does not shrink the layout.
+    fn layout_to_wire(&self, layout: &Layout) -> Layout {
+        let my_id = self.endpoint.id().to_string();
+        let by_name = self.peers_by_name.read().unwrap();
+        map_layout(layout, |r: &str| {
+            if r == self.my_name {
+                return Some(my_id.clone());
+            }
+            if let Some(id) = by_name.get(r) {
+                return Some(id.to_string());
+            }
+            r.parse::<EndpointId>().ok().map(|_| r.to_string())
+        })
+    }
+
+    /// Endpoint ids -> local names, for a layout that just arrived.
+    ///
+    /// An id we have no name for is kept verbatim rather than dropped; the
+    /// TUI shows it abbreviated until the machine is paired and named.
+    fn layout_from_wire(&self, layout: &Layout) -> Layout {
+        let my_id = self.endpoint.id().to_string();
+        let by_id = self.names_by_id.read().unwrap();
+        map_layout(layout, |r: &str| {
+            if r == my_id {
+                return Some(self.my_name.clone());
+            }
+            // Anything that is not an id came from a host speaking an older
+            // dialect of this message; its names are not ours to interpret.
+            match r.parse::<EndpointId>() {
+                Ok(id) => Some(by_id.get(&id).cloned().unwrap_or_else(|| r.to_string())),
+                Err(_) => None,
+            }
+        })
     }
 
     // ---- mesh ----
@@ -672,4 +753,67 @@ async fn unique_path(dir: &Path, base: &str) -> PathBuf {
         }
     }
     dir.join(format!("{stem} (overflow){ext}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn layout(entries: &[(&str, Option<&str>, Option<&str>)]) -> Layout {
+        let mut m = BTreeMap::new();
+        for (screen, left, right) in entries {
+            m.insert(
+                screen.to_string(),
+                Neighbors {
+                    left: left.map(str::to_string),
+                    right: right.map(str::to_string),
+                    ..Default::default()
+                },
+            );
+        }
+        Layout(m)
+    }
+
+    /// The bug this translation exists for: two hosts calling the same machine
+    /// different things must not produce two screens after a round trip.
+    #[test]
+    fn foreign_names_come_back_as_local_ones() {
+        // "desktop" knows machine X as `laptop`; we know the same X as `mac`.
+        let wire = map_layout(&layout(&[("desktop", None, Some("laptop"))]), |r: &str| {
+            Some(match r {
+                "desktop" => "id-desktop",
+                "laptop" => "id-x",
+                other => other,
+            }
+            .to_string())
+        });
+        let local = map_layout(&wire, |r: &str| {
+            Some(match r {
+                "id-desktop" => "desktop",
+                "id-x" => "mac",
+                other => other,
+            }
+            .to_string())
+        });
+        assert_eq!(local, layout(&[("desktop", None, Some("mac"))]));
+    }
+
+    #[test]
+    fn unresolvable_references_are_dropped() {
+        // A name that resolves to nothing is meaningless to the other side.
+        let out = map_layout(
+            &layout(&[("a", None, Some("ghost")), ("ghost", Some("a"), None)]),
+            |r: &str| (r != "ghost").then(|| r.to_string()),
+        );
+        assert_eq!(out, layout(&[]), "an emptied screen is pruned too");
+    }
+
+    #[test]
+    fn partially_resolvable_screen_keeps_its_other_edges() {
+        let out = map_layout(
+            &layout(&[("a", Some("ghost"), Some("b"))]),
+            |r: &str| (r != "ghost").then(|| r.to_string()),
+        );
+        assert_eq!(out, layout(&[("a", None, Some("b"))]));
+    }
 }

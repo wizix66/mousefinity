@@ -37,7 +37,8 @@ computer. You decide how the screens are arranged.
 
 Grab a prebuilt binary from the
 [releases page](https://github.com/wizix66/mousefinity/releases)
-(Windows, Linux, macOS Intel + Apple Silicon), or build from source:
+(Windows, Linux x86-64 and arm64, macOS Intel + Apple Silicon), or build from
+source:
 
 ```sh
 cargo build --release          # produces target/release/mousefinity(.exe)
@@ -112,6 +113,36 @@ Send a file to whichever peer you like (daemon must be running):
 mousefinity send laptop path/to/file.pdf   # lands in ~/Downloads/mousefinity
 ```
 
+## Staying current
+
+```sh
+mousefinity upgrade --check   # is there a newer release?
+mousefinity upgrade           # download it and replace this binary
+```
+
+The download is checked against the `SHA256SUMS` published with the release
+(falling back to GitHub's own asset digest) before anything is installed, and
+the swap is a rename — an interrupted upgrade leaves the working binary in
+place. Run it wherever the binary lives; a system-wide install needs the same
+privileges that writing there would. Restart any running daemon afterwards.
+
+Self-update covers every published target, including **arm64 Linux** — handy
+for a relay parked on an Ampere or Graviton box, where the alternative is
+re-downloading by hand over SSH.
+
+## Reporting a problem
+
+```sh
+mousefinity report            # writes a diagnostic bundle to your downloads
+```
+
+The bundle collects version and platform details, your configuration, and a
+full `doctor` run. **Nothing is uploaded** — it is a local file you read and
+then attach to an issue yourself; there is no telemetry in mousefinity. The
+mesh token is redacted and the identity key is never read, but the file does
+contain peer names, pairing ids, your public IP and which relay you reached,
+so give it a look before posting it.
+
 ## Configuration
 
 `~/.config/mousefinity/config.toml` (Linux/macOS) or
@@ -152,6 +183,13 @@ revisions onward, so you only ever edit the arrangement on one machine.
 Trust does *not* sync, by design: each machine decides for itself which
 public keys it accepts, so `add-peer` stays a per-machine step.
 
+**Names are local.** A machine *is* its pairing id; the name is just your
+label for it. Two hosts can call the same machine different things — one
+`laptop`, another `mac` — and both stay correct: layouts travel keyed by id
+and are translated into each host's own names on arrival. If a synced layout
+mentions a machine you have not paired with, it shows up as an abbreviated
+id until you `add-peer` it under whatever name you like.
+
 The identity key lives next to the config (`secret.key`). Protect it like an
 SSH private key; the pairing id printed by `init`/`id` is the public half.
 
@@ -161,7 +199,7 @@ SSH private key; the pairing id printed by `init`/`id` is the public half.
 | -------- | -------------- | ------------- | --------- | ----- | ----- |
 | Windows  | ✅ | ✅ | ✅ | ✅ | DPI-aware; low-level hooks |
 | macOS    | ✅ | ✅ | ✅ | ✅ | grant Accessibility + Input Monitoring to the binary |
-| Linux X11 | ✅ | ✅ | ✅ | ✅ | capture uses evdev: add your user to the `input` group |
+| Linux X11 | ✅ | ✅ | ✅ | ✅ | capture uses evdev: add your user to the `input` group. x86-64 and arm64 (Ampere, Graviton, Raspberry Pi) both ship |
 | Linux Wayland | ⚠️ | ⚠️ | ✅ | ✅ | injection depends on compositor support; capture via evdev |
 | Android  | 🚧 | 🚧 | 🚧 | 🚧 | core crates build for `aarch64-linux-android`; needs an AccessibilityService app shell (planned) |
 | iOS      | 🚧 | ❌ | 🚧 | 🚧 | Apple provides no API for system-wide input injection; an iOS node can only ever be a controller/clipboard/file peer, not a controlled screen |

@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Protocol version. Bump on incompatible changes; peers refuse mismatches.
-pub const PROTO_VERSION: u16 = 2;
+///
+/// v3: `Msg::Layout` is keyed by endpoint id rather than host name.
+pub const PROTO_VERSION: u16 = 3;
 
 /// ALPN for the long-lived control/input connection between paired hosts.
 pub const ALPN_CONTROL: &[u8] = b"mousefinity/ctl/1";
@@ -187,6 +189,12 @@ pub enum Msg {
     /// (milliseconds since the Unix epoch of the last local edit). Receivers
     /// adopt strictly newer revisions, persist them, and gossip them onward,
     /// so a `link`/TUI edit on any machine reaches every connected peer.
+    ///
+    /// On the wire the [`Layout`] is keyed by **endpoint id**, not host name:
+    /// two hosts may call the same machine different things locally, and a
+    /// name-keyed layout would make those aliases collide into phantom extra
+    /// screens. The daemon translates to and from local names at the network
+    /// boundary, so each host keeps its own naming.
     Layout { rev: u64, layout: Layout },
     /// Mesh roster gossip: every member the sender knows about. Receivers
     /// take the union, persist newcomers as trusted peers, and re-gossip on
@@ -331,7 +339,13 @@ impl Neighbors {
     }
 }
 
-/// The virtual arrangement of screens, keyed by host name.
+/// The virtual arrangement of screens.
+///
+/// The key is a *screen reference*, whose meaning depends on where the layout
+/// lives: on disk and inside the daemon it is a local host name, on the wire
+/// it is an endpoint id (see [`Msg::Layout`]). A reference that a host has no
+/// name for stays a raw id locally, so layouts survive gossip through hosts
+/// that have not paired with every machine.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Layout(pub std::collections::BTreeMap<String, Neighbors>);
 

@@ -97,17 +97,18 @@ pub fn run() -> Result<()> {
 // ---- state helpers ----
 
 impl App {
-    /// Every screen name known to this config: self, peers, plus any name a
-    /// synced layout mentions.
+    /// Every screen known to this config: self, peers, plus anything a synced
+    /// layout mentions. Layouts arrive translated into local names, so a peer
+    /// listed here under our name for it cannot also appear under theirs.
     fn screens(&self) -> Vec<String> {
         let mut set = BTreeSet::new();
         set.insert(self.cfg.name.clone());
-        set.extend(self.cfg.peers.keys().cloned());
+        set.extend(self.peer_names());
         for (name, n) in &self.cfg.layout {
-            set.insert(name.clone());
+            set.insert(self.canonical(name));
             for e in [Edge::Left, Edge::Right, Edge::Up, Edge::Down] {
                 if let Some(t) = n.get(e) {
-                    set.insert(t.to_string());
+                    set.insert(self.canonical(t));
                 }
             }
         }
@@ -117,8 +118,45 @@ impl App {
         v
     }
 
+    /// One row per machine. The id is the identity, so a machine added twice
+    /// under different names is one peer as far as the daemon is concerned;
+    /// it is listed once, under the first of its names alphabetically.
     fn peer_names(&self) -> Vec<String> {
-        self.cfg.peers.keys().cloned().collect()
+        let mut seen = BTreeSet::new();
+        self.cfg
+            .peers
+            .iter()
+            .filter(|(_, p)| seen.insert(p.id.clone()))
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+
+    /// Collapse an alias onto the single name the peer list shows for that
+    /// machine, so a layout edge written against one alias does not surface as
+    /// a second screen. Unknown names (raw ids, this host) pass through.
+    fn canonical(&self, name: &str) -> String {
+        let Some(id) = self.cfg.peers.get(name).map(|p| &p.id) else {
+            return name.to_string();
+        };
+        self.cfg
+            .peers
+            .iter()
+            .find(|(_, q)| q.id == *id)
+            .map(|(n, _)| n.clone())
+            .unwrap_or_else(|| name.to_string())
+    }
+
+    /// Every name this config uses for the same machine as `name`.
+    fn aliases_of(&self, name: &str) -> Vec<String> {
+        let Some(id) = self.cfg.peers.get(name).map(|p| p.id.clone()) else {
+            return vec![name.to_string()];
+        };
+        self.cfg
+            .peers
+            .iter()
+            .filter(|(_, p)| p.id == id)
+            .map(|(n, _)| n.clone())
+            .collect()
     }
 
     fn selected_peer(&self) -> Option<String> {
@@ -181,12 +219,17 @@ impl App {
     }
 
     fn remove_peer(&mut self, name: &str) {
-        self.cfg.peers.remove(name);
-        self.cfg.layout.remove(name);
-        for n in self.cfg.layout.values_mut() {
-            for e in [Edge::Left, Edge::Right, Edge::Up, Edge::Down] {
-                if n.get(e) == Some(name) {
-                    *n.get_mut(e) = None;
+        // The list collapses a machine's aliases into one row, so removing
+        // that row has to retire all of them — otherwise a hidden duplicate
+        // would keep the peer trusted and reappear on the next redraw.
+        for alias in self.aliases_of(name) {
+            self.cfg.peers.remove(&alias);
+            self.cfg.layout.remove(&alias);
+            for n in self.cfg.layout.values_mut() {
+                for e in [Edge::Left, Edge::Right, Edge::Up, Edge::Down] {
+                    if n.get(e) == Some(alias.as_str()) {
+                        *n.get_mut(e) = None;
+                    }
                 }
             }
         }
@@ -454,6 +497,16 @@ fn draw_peers(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_stateful_widget(list, area, &mut app.peers_state);
 }
 
+/// A screen the layout mentions but this host has no name for stays a raw
+/// endpoint id; abbreviate it so it does not swamp the row.
+fn screen_label(s: &str) -> String {
+    if s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        format!("{}…", &s[..12])
+    } else {
+        s.to_string()
+    }
+}
+
 fn draw_layout(f: &mut Frame, app: &mut App, area: Rect) {
     let screens = app.screens();
     let sel = app.screens_state.selected().unwrap_or(0).min(screens.len().saturating_sub(1));
@@ -461,10 +514,11 @@ fn draw_layout(f: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .map(|s| {
             let n = app.cfg.layout.get(s).cloned().unwrap_or_default();
-            let fmt = |o: Option<&str>| o.unwrap_or("·").to_string();
+            let fmt = |o: Option<&str>| o.map(screen_label).unwrap_or_else(|| "·".into());
             let me = if *s == app.cfg.name { " (this host)" } else { "" };
             Line::from(format!(
-                "{s}{me}   ←{} →{} ↑{} ↓{}",
+                "{}{me}   ←{} →{} ↑{} ↓{}",
+                screen_label(s),
                 fmt(n.left.as_deref()),
                 fmt(n.right.as_deref()),
                 fmt(n.up.as_deref()),
@@ -483,9 +537,10 @@ fn draw_layout(f: &mut Frame, app: &mut App, area: Rect) {
 
     let detail = if let Some(s) = screens.get(sel) {
         let n = app.cfg.layout.get(s).cloned().unwrap_or_default();
-        let fmt = |o: Option<&str>| o.unwrap_or("(none)").to_string();
+        let fmt = |o: Option<&str>| o.map(screen_label).unwrap_or_else(|| "(none)".into());
         format!(
-            "{s}: left={} right={} up={} down={}\npress an arrow key to change that edge",
+            "{}: left={} right={} up={} down={}\npress an arrow key to change that edge",
+            screen_label(s),
             fmt(n.left.as_deref()),
             fmt(n.right.as_deref()),
             fmt(n.up.as_deref()),
@@ -547,4 +602,90 @@ fn draw_pick_modal(f: &mut Frame, app: &mut App, screen: &str, edge: Edge) {
         .block(Block::bordered().title(format!(" {} of {screen} ", edge.name())))
         .highlight_style(Style::new().reversed());
     f.render_stateful_widget(list, area, &mut app.pick_state);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Peer;
+
+    const ID_X: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const ID_Y: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+    /// This host is `desktop`; machine X is trusted under two names, which is
+    /// what happens when it was added by hand on one side and imported by mesh
+    /// gossip on the other.
+    fn app_with_aliases() -> App {
+        let mut peers = BTreeMap::new();
+        peers.insert("laptop".to_string(), Peer { id: ID_X.into(), addrs: vec![] });
+        peers.insert("macbook".to_string(), Peer { id: ID_X.into(), addrs: vec![] });
+        peers.insert("tablet".to_string(), Peer { id: ID_Y.into(), addrs: vec![] });
+        let mut layout = BTreeMap::new();
+        // The layout edge was written against the alias the list hides.
+        layout.insert(
+            "desktop".to_string(),
+            Neighbors { right: Some("macbook".into()), ..Default::default() },
+        );
+        layout.insert(
+            "macbook".to_string(),
+            Neighbors { left: Some("desktop".into()), ..Default::default() },
+        );
+        App {
+            baseline_layout: layout.clone(),
+            cfg: Config {
+                name: "desktop".into(),
+                screen: None,
+                downloads: None,
+                network: Default::default(),
+                mesh_secret: None,
+                peers,
+                layout,
+                layout_rev: 0,
+            },
+            my_id: "0".repeat(64),
+            dirty: false,
+            pane: Pane::Peers,
+            peers_state: ListState::default().with_selected(Some(0)),
+            screens_state: ListState::default().with_selected(Some(0)),
+            pick_state: ListState::default().with_selected(Some(0)),
+            mode: Mode::Normal,
+            input_name: String::new(),
+            input_id: String::new(),
+            status: String::new(),
+            quit_armed: false,
+        }
+    }
+
+    #[test]
+    fn one_row_per_machine_not_per_name() {
+        let app = app_with_aliases();
+        assert_eq!(app.peer_names(), vec!["laptop", "tablet"]);
+    }
+
+    #[test]
+    fn layout_edge_via_an_alias_does_not_add_a_screen() {
+        let app = app_with_aliases();
+        // Without canonicalisation `macbook` would show up beside `laptop`.
+        assert_eq!(app.screens(), vec!["desktop", "laptop", "tablet"]);
+    }
+
+    #[test]
+    fn removing_a_machine_removes_all_its_names() {
+        let mut app = app_with_aliases();
+        app.remove_peer("laptop");
+        assert!(
+            !app.cfg.peers.contains_key("macbook"),
+            "the hidden alias must go too, or the peer stays trusted and reappears"
+        );
+        assert_eq!(app.peer_names(), vec!["tablet"]);
+        // The edge that pointed at the removed machine is cleared, not left
+        // dangling at a name nothing resolves.
+        assert!(!app.screens().contains(&"macbook".to_string()));
+    }
+
+    #[test]
+    fn a_raw_id_screen_is_abbreviated_but_a_name_is_left_alone() {
+        assert_eq!(screen_label(ID_X), "111111111111…");
+        assert_eq!(screen_label("laptop"), "laptop");
+    }
 }

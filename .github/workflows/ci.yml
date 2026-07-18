@@ -15,6 +15,9 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
+          # arm64 Linux is a published release target, so it gets built here
+          # too rather than only being exercised at tag time.
+          - os: ubuntu-24.04-arm
           - os: macos-latest
           - os: windows-latest
     runs-on: ${{ matrix.os }}

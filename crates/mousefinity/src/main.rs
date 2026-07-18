@@ -1,6 +1,7 @@
 mod capture;
 mod clipboard;
 mod config;
+mod diag;
 mod doctor;
 mod engine;
 mod inject;
@@ -9,6 +10,7 @@ mod keymap;
 mod mesh;
 mod net;
 mod tui;
+mod upgrade;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -60,6 +62,23 @@ enum Cmd {
         #[command(subcommand)]
         cmd: MeshCmd,
     },
+    /// Update to the newest release published on GitHub.
+    Upgrade {
+        /// Only report whether a newer release exists.
+        #[arg(long)]
+        check: bool,
+        /// Install without asking for confirmation.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Write a diagnostic bundle to attach to a bug report. Nothing is
+    /// uploaded; the mesh token and identity key are never included.
+    #[command(alias = "diagnostics")]
+    Report {
+        /// Where to write it (default: your downloads folder).
+        #[arg(long, short)]
+        output: Option<PathBuf>,
+    },
     /// Run the daemon (input sharing, clipboard sync, file receiving).
     Run,
     /// Send files to a peer via the running daemon.
@@ -82,9 +101,11 @@ fn main() -> Result<()> {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
     let cli = Cli::parse();
-    // Doctor prints a human report; keep library logging out of it unless
-    // the user explicitly asks via RUST_LOG.
-    let default_filter = if matches!(cli.cmd, Cmd::Doctor) {
+    // Drop the binary a previous Windows upgrade had to leave behind.
+    upgrade::clean_stale();
+    // These print a human report; keep library logging out of it unless the
+    // user explicitly asks via RUST_LOG.
+    let default_filter = if matches!(cli.cmd, Cmd::Doctor | Cmd::Report { .. }) {
         "error"
     } else {
         "info,iroh=warn"
@@ -103,6 +124,8 @@ fn main() -> Result<()> {
         Cmd::Tui => tui::run(),
         Cmd::Doctor => doctor::run(),
         Cmd::Mesh { cmd } => cmd_mesh(cmd),
+        Cmd::Upgrade { check, yes } => upgrade::run(check, yes),
+        Cmd::Report { output } => diag::run(output),
         Cmd::Run => cmd_run(),
         Cmd::Send { peer, files } => ipc::client_send(&peer, &files),
     }
@@ -320,13 +343,16 @@ fn cmd_run() -> Result<()> {
         .context("cannot detect screen size; set `screen = [width, height]` in the config")?;
     info!("host `{}`, screen {}x{}", cfg.name, screen.0, screen.1);
     // Synced layouts may legitimately mention screens this host has not
-    // paired with (yet); such edges simply never trigger a hop here.
+    // paired with (yet); such edges simply never trigger a hop here. Those
+    // arrive as raw endpoint ids, since a name for them is exactly what this
+    // host is missing.
     for (screen_name, n) in &cfg.layout {
         for neighbor in [&n.left, &n.right, &n.up, &n.down].into_iter().flatten() {
             if neighbor != &cfg.name && !cfg.peers.contains_key(neighbor) {
                 tracing::warn!(
                     "layout references `{neighbor}` (from `{screen_name}`) but it is not a \
-                     paired peer on this host"
+                     paired peer on this host; add it with `mousefinity add-peer <name> \
+                     {neighbor}` to give it a name and make that edge live"
                 );
             }
         }
