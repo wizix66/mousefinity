@@ -229,7 +229,7 @@ sequenceDiagram
         A->>R: QUIC via relay
         R->>B: forward (still end-to-end encrypted)
     end
-    Note over A,B: first working path carries traffic;<br/>connection migrates to the best direct path
+    Note over A,B: first working path carries traffic —<br/>connection migrates to the best direct path
 ```
 
 Details that matter for your network:
