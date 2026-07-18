@@ -103,6 +103,17 @@ async fn handle(stream: tokio::net::TcpStream, net: Arc<Net>, token: &str) -> Re
                 message: format!("{e:#}"),
             },
         }
+    } else if req.cmd == "join" {
+        match net.join_bootstrap(&req.peer).await {
+            Ok(m) => Response {
+                ok: true,
+                message: m,
+            },
+            Err(e) => Response {
+                ok: false,
+                message: format!("{e:#}"),
+            },
+        }
     } else {
         Response {
             ok: false,
@@ -156,6 +167,16 @@ pub fn daemon_reachable() -> bool {
 /// Tell a running daemon to re-read its config. Returns its status message.
 pub fn client_reload() -> Result<String> {
     let resp = client_request("reload", "", "")?;
+    if resp.ok {
+        Ok(resp.message)
+    } else {
+        anyhow::bail!("{}", resp.message)
+    }
+}
+
+/// Ask the running daemon to perform a mesh join via `bootstrap`.
+pub fn client_join(bootstrap: &str) -> Result<String> {
+    let resp = client_request("join", bootstrap, "")?;
     if resp.ok {
         Ok(resp.message)
     } else {

@@ -6,6 +6,7 @@ mod engine;
 mod inject;
 mod ipc;
 mod keymap;
+mod mesh;
 mod net;
 mod tui;
 
@@ -53,6 +54,12 @@ enum Cmd {
     /// Diagnose connectivity: what this network blocks, relay health, and
     /// whether each peer is reachable directly or only via relay.
     Doctor,
+    /// Mesh: one shared token that lets machines discover and trust each
+    /// other automatically (tenant-isolated even on a shared relay).
+    Mesh {
+        #[command(subcommand)]
+        cmd: MeshCmd,
+    },
     /// Run the daemon (input sharing, clipboard sync, file receiving).
     Run,
     /// Send files to a peer via the running daemon.
@@ -95,6 +102,7 @@ fn main() -> Result<()> {
         Cmd::Link { a, edge, b } => cmd_link(a, edge, b),
         Cmd::Tui => tui::run(),
         Cmd::Doctor => doctor::run(),
+        Cmd::Mesh { cmd } => cmd_mesh(cmd),
         Cmd::Run => cmd_run(),
         Cmd::Send { peer, files } => ipc::client_send(&peer, &files),
     }
@@ -122,6 +130,7 @@ fn cmd_init(name: Option<String>) -> Result<()> {
             screen: None,
             downloads: None,
             network: Default::default(),
+            mesh_secret: None,
             peers: Default::default(),
             layout: Default::default(),
             layout_rev: 0,
@@ -184,6 +193,117 @@ fn cmd_link(a: String, edge: String, b: String) -> Result<()> {
         Ok(_) => println!("daemon reloaded — layout is syncing to connected peers"),
         Err(_) => println!("no running daemon — layout will sync when the daemon starts"),
     }
+    Ok(())
+}
+
+#[derive(Subcommand)]
+enum MeshCmd {
+    /// Create a mesh token on this host (making it the first member).
+    Init,
+    /// Print this mesh's join ticket to share with a new machine.
+    Ticket,
+    /// Join a mesh using a ticket from `mousefinity mesh ticket`.
+    Join { ticket: String },
+}
+
+fn cmd_mesh(cmd: MeshCmd) -> Result<()> {
+    match cmd {
+        MeshCmd::Init => {
+            let mut cfg = config::load()?;
+            if cfg.mesh_secret.is_none() {
+                let mut secret = [0u8; 32];
+                use rand::Rng;
+                rand::rng().fill_bytes(&mut secret);
+                cfg.mesh_secret = Some(data_encoding::HEXLOWER.encode(&secret));
+                config::save(&cfg)?;
+                println!("mesh created.");
+            } else {
+                println!("this host already has a mesh token.");
+            }
+            let _ = ipc::client_reload();
+            print_ticket(&cfg.name)
+        }
+        MeshCmd::Ticket => {
+            let cfg = config::load()?;
+            if cfg.mesh_secret.is_none() {
+                bail!("no mesh on this host — run `mousefinity mesh init` first");
+            }
+            print_ticket(&cfg.name)
+        }
+        MeshCmd::Join { ticket } => cmd_mesh_join(&ticket),
+    }
+}
+
+fn print_ticket(my_name: &str) -> Result<()> {
+    let cfg = config::load()?;
+    let secret = cfg
+        .mesh_secret_bytes()?
+        .context("no mesh token configured")?;
+    let key = identity()?;
+    let ticket = mesh::Ticket {
+        secret,
+        bootstrap_id: *key.public().as_bytes(),
+        bootstrap_name: my_name.to_string(),
+    };
+    println!("share this ticket with a machine you want to add:");
+    println!("  {}", mesh::encode_ticket(&ticket));
+    println!("(anyone with the ticket can join — treat it like a Wi-Fi password)");
+    Ok(())
+}
+
+fn cmd_mesh_join(ticket: &str) -> Result<()> {
+    let t = mesh::decode_ticket(ticket)?;
+    let bootstrap_id = iroh::EndpointId::from_bytes(&t.bootstrap_id)
+        .map_err(|_| anyhow::anyhow!("ticket contains an invalid bootstrap id"))?;
+    let mut cfg = config::load()?;
+    if cfg.name == t.bootstrap_name {
+        bail!(
+            "this host is named `{}`, same as the ticket's bootstrap — rename one first",
+            cfg.name
+        );
+    }
+    cfg.mesh_secret = Some(data_encoding::HEXLOWER.encode(&t.secret));
+    cfg.peers.insert(
+        t.bootstrap_name.clone(),
+        config::Peer {
+            id: bootstrap_id.to_string(),
+            addrs: vec![],
+        },
+    );
+    config::save(&cfg)?;
+
+    if ipc::daemon_reachable() {
+        // The daemon holds our identity; let it do the handshake.
+        ipc::client_reload().context("daemon reload failed")?;
+        let msg = ipc::client_join(&t.bootstrap_name)?;
+        println!("{msg}");
+    } else {
+        // No daemon: run the handshake with a temporary endpoint.
+        let secret_key = config::load_or_create_secret()?;
+        let rt = tokio::runtime::Runtime::new()?;
+        let summary = rt.block_on(async {
+            let (endpoint, custom_relay) = net::bind_endpoint(&cfg, secret_key).await?;
+            let mut target = iroh::EndpointAddr::new(bootstrap_id);
+            if let Some(url) = custom_relay {
+                target = target.with_relay_url(url);
+            }
+            let me = mousefinity_proto::Member {
+                name: cfg.name.clone(),
+                id: endpoint.id().to_string(),
+            };
+            let members = net::join_handshake(&endpoint, &t.secret, target, me).await?;
+            endpoint.close().await;
+            let added = config::add_members(&members)?;
+            anyhow::Ok(format!(
+                "joined mesh: {} member(s) known, {} imported",
+                members.len(),
+                added.len()
+            ))
+        })?;
+        println!("{summary}");
+        println!("start `mousefinity run` and the mesh will connect.");
+    }
+    println!("tip: arrange the new screen with `mousefinity link` or the TUI — layout syncs everywhere.");
     Ok(())
 }
 

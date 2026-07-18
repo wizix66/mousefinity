@@ -380,6 +380,8 @@ impl Engine {
                 }
             }
             Msg::Layout { rev, layout } => self.adopt_layout(rev, layout, Some(&name)),
+            // Rosters are consumed by the net layer; nothing to do here.
+            Msg::Roster { .. } => {}
             Msg::Hello { .. } => {}
         }
     }

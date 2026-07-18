@@ -45,6 +45,10 @@ pub struct Config {
     /// Network tuning (fixed port, relay policy).
     #[serde(default, skip_serializing_if = "is_default_network")]
     pub network: Network,
+    /// Mesh token (hex). Hosts sharing this secret trust each other and
+    /// exchange rosters automatically. Treat it like a Wi-Fi password.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh_secret: Option<String>,
     /// Trusted peers by name. Only these may connect.
     #[serde(default)]
     pub peers: BTreeMap<String, Peer>,
@@ -59,6 +63,20 @@ pub struct Config {
 impl Config {
     pub fn layout(&self) -> Layout {
         Layout(self.layout.clone())
+    }
+
+    pub fn mesh_secret_bytes(&self) -> Result<Option<[u8; 32]>> {
+        match &self.mesh_secret {
+            None => Ok(None),
+            Some(hex) => {
+                let bytes = data_encoding::HEXLOWER
+                    .decode(hex.trim().as_bytes())
+                    .ok()
+                    .and_then(|v| <[u8; 32]>::try_from(v).ok())
+                    .context("mesh_secret must be 64 hex characters")?;
+                Ok(Some(bytes))
+            }
+        }
     }
 
     pub fn downloads_dir(&self) -> PathBuf {
@@ -113,8 +131,14 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Serializes read-modify-write cycles on the config file across the
+/// daemon's threads (layout sync on the engine thread, roster merges on the
+/// network runtime).
+static FILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Persist a layout adopted from a peer, unless the on-disk copy is newer.
 pub fn save_synced_layout(rev: u64, layout: &Layout) -> Result<()> {
+    let _guard = FILE_LOCK.lock().unwrap();
     let mut cfg = load()?;
     if cfg.layout_rev >= rev {
         return Ok(());
@@ -122,6 +146,47 @@ pub fn save_synced_layout(rev: u64, layout: &Layout) -> Result<()> {
     cfg.layout_rev = rev;
     cfg.layout = layout.0.clone();
     save(&cfg)
+}
+
+/// Merge mesh roster members into the trusted peer list on disk. Returns
+/// the members that were actually added. Conflicts (an existing name with a
+/// different id, or an id already known under another name) are skipped —
+/// existing local configuration always wins.
+pub fn add_members(members: &[mousefinity_proto::Member]) -> Result<Vec<mousefinity_proto::Member>> {
+    let _guard = FILE_LOCK.lock().unwrap();
+    let mut cfg = load()?;
+    let mut added = Vec::new();
+    for m in members {
+        if m.name.is_empty() || m.name == cfg.name {
+            continue;
+        }
+        match cfg.peers.get(&m.name) {
+            Some(existing) if existing.id == m.id => {}
+            Some(_) => {
+                tracing::warn!(
+                    "mesh roster: name `{}` conflicts with an existing peer; keeping local entry",
+                    m.name
+                );
+            }
+            None => {
+                if cfg.peers.values().any(|p| p.id == m.id) {
+                    continue; // same machine under a different name
+                }
+                cfg.peers.insert(
+                    m.name.clone(),
+                    Peer {
+                        id: m.id.clone(),
+                        addrs: vec![],
+                    },
+                );
+                added.push(m.clone());
+            }
+        }
+    }
+    if !added.is_empty() {
+        save(&cfg)?;
+    }
+    Ok(added)
 }
 
 pub fn save(cfg: &Config) -> Result<()> {

@@ -12,7 +12,8 @@ use anyhow::{bail, Context, Result};
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use mousefinity_proto::{
-    read_frame, write_frame, FileOffer, Msg, ALPN_CONTROL, ALPN_FILE, PROTO_VERSION,
+    read_frame, write_frame, FileOffer, JoinRequest, JoinResponse, Member, Msg, ALPN_CONTROL,
+    ALPN_FILE, ALPN_JOIN, PROTO_VERSION,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::{self, UnboundedSender};
@@ -31,6 +32,11 @@ pub struct Net {
     static_addrs: RwLock<HashMap<String, Vec<std::net::SocketAddr>>>,
     /// Self-hosted relay all peers share, when `[network] relay` is a URL.
     custom_relay: Option<iroh::RelayUrl>,
+    /// Mesh token, when this host is part of a mesh.
+    mesh: RwLock<Option<[u8; 32]>>,
+    /// Live control-link senders by peer name, for roster broadcasts.
+    /// Epoch-tagged so a stale link's teardown can't evict its successor.
+    control_txs: Mutex<HashMap<String, (u64, UnboundedSender<Msg>)>>,
     /// Peer names that currently have a live dial task.
     dialing: Mutex<HashSet<String>>,
     engine_tx: UnboundedSender<EngineIn>,
@@ -84,7 +90,11 @@ pub async fn bind_endpoint(
     };
     builder = builder
         .secret_key(SecretKey::from_bytes(&secret))
-        .alpns(vec![ALPN_CONTROL.to_vec(), ALPN_FILE.to_vec()])
+        .alpns(vec![
+            ALPN_CONTROL.to_vec(),
+            ALPN_FILE.to_vec(),
+            ALPN_JOIN.to_vec(),
+        ])
         // Advertise and resolve peers directly on the local network:
         // same-LAN hosts find each other with zero internet access.
         .address_lookup(iroh_mdns_address_lookup::MdnsAddressLookup::builder())
@@ -136,6 +146,7 @@ impl Net {
         engine_tx: UnboundedSender<EngineIn>,
     ) -> Result<Arc<Self>> {
         let (peers_by_name, names_by_id, static_addrs) = parse_peers(cfg)?;
+        let mesh = cfg.mesh_secret_bytes()?;
         let (endpoint, custom_relay) = bind_endpoint(cfg, secret).await?;
         Ok(Arc::new(Self {
             endpoint,
@@ -145,6 +156,8 @@ impl Net {
             names_by_id: RwLock::new(names_by_id),
             static_addrs: RwLock::new(static_addrs),
             custom_relay,
+            mesh: RwLock::new(mesh),
+            control_txs: Mutex::new(HashMap::new()),
             dialing: Mutex::new(HashSet::new()),
             engine_tx,
             epoch: AtomicU64::new(0),
@@ -165,6 +178,7 @@ impl Net {
         *self.peers_by_name.write().unwrap() = by_name;
         *self.names_by_id.write().unwrap() = by_id;
         *self.static_addrs.write().unwrap() = statics;
+        *self.mesh.write().unwrap() = cfg.mesh_secret_bytes()?;
         self.spawn_dials();
         let _ = self.engine_tx.send(EngineIn::SetLayout {
             rev: cfg.layout_rev,
@@ -210,6 +224,15 @@ impl Net {
                     }
                 };
                 let id = conn.remote_id();
+                // Join handshakes are how unknown machines BECOME trusted;
+                // they authenticate with the mesh token instead of the peer
+                // list, so dispatch them before the trust check.
+                if conn.alpn() == ALPN_JOIN {
+                    if let Err(e) = net.handle_join_accept(conn).await {
+                        debug!("join handshake failed: {e:#}");
+                    }
+                    return;
+                }
                 let name = net.names_by_id.read().unwrap().get(&id).cloned();
                 let Some(name) = name else {
                     warn!("rejecting connection from unknown endpoint {id}");
@@ -283,7 +306,7 @@ impl Net {
     /// Run one control link: hello exchange, then pump messages both ways
     /// until the connection dies.
     async fn handle_control(
-        &self,
+        self: &Arc<Self>,
         name: String,
         conn: iroh::endpoint::Connection,
         dialer: bool,
@@ -319,8 +342,19 @@ impl Net {
             name: name.clone(),
             screen,
             epoch,
-            tx,
+            tx: tx.clone(),
         });
+        self.control_txs
+            .lock()
+            .unwrap()
+            .insert(name.clone(), (epoch, tx.clone()));
+        // Mesh members swap rosters on every link-up, so machines that were
+        // offline when someone joined catch up as soon as they reconnect.
+        if self.mesh.read().unwrap().is_some() {
+            let _ = tx.send(Msg::Roster {
+                members: self.roster(),
+            });
+        }
 
         let write_loop = async {
             while let Some(msg) = rx.recv().await {
@@ -330,13 +364,26 @@ impl Net {
         };
         let engine_tx = self.engine_tx.clone();
         let peer_name = name.clone();
+        let net = self.clone();
         let read_loop = async {
             loop {
                 let msg: Msg = read_frame(&mut recv).await?;
-                let _ = engine_tx.send(EngineIn::PeerMsg {
-                    name: peer_name.clone(),
-                    msg,
-                });
+                match msg {
+                    // Rosters are a trust concern; they stop at the net layer.
+                    Msg::Roster { members } => {
+                        if net.mesh.read().unwrap().is_some() {
+                            if let Err(e) = net.apply_roster(&members) {
+                                warn!("roster merge failed: {e:#}");
+                            }
+                        }
+                    }
+                    msg => {
+                        let _ = engine_tx.send(EngineIn::PeerMsg {
+                            name: peer_name.clone(),
+                            msg,
+                        });
+                    }
+                }
             }
             #[allow(unreachable_code)]
             Ok::<_, anyhow::Error>(())
@@ -345,8 +392,152 @@ impl Net {
             r = write_loop => r,
             r = read_loop => r,
         };
+        {
+            let mut txs = self.control_txs.lock().unwrap();
+            if txs.get(&name).is_some_and(|(e, _)| *e == epoch) {
+                txs.remove(&name);
+            }
+        }
         let _ = self.engine_tx.send(EngineIn::PeerDown { name, epoch });
         result
+    }
+
+    // ---- mesh ----
+
+    /// Every member this host knows about, including itself.
+    fn roster(&self) -> Vec<Member> {
+        let mut members = vec![Member {
+            name: self.my_name.clone(),
+            id: self.endpoint.id().to_string(),
+        }];
+        for (name, id) in self.peers_by_name.read().unwrap().iter() {
+            members.push(Member {
+                name: name.clone(),
+                id: id.to_string(),
+            });
+        }
+        members
+    }
+
+    /// Merge roster members: persist newcomers, trust them, start dialing
+    /// them, and re-gossip the grown roster to every connected member.
+    /// Convergent: re-broadcast happens only when something was new.
+    fn apply_roster(self: &Arc<Self>, members: &[Member]) -> Result<()> {
+        let my_id_hex = self.endpoint.id().to_string();
+        let candidates: Vec<Member> = members
+            .iter()
+            .filter(|m| m.id != my_id_hex)
+            .cloned()
+            .collect();
+        let added = crate::config::add_members(&candidates)?;
+        if added.is_empty() {
+            return Ok(());
+        }
+        for m in &added {
+            match m.id.parse::<EndpointId>() {
+                Ok(id) => {
+                    info!("mesh: added member `{}`", m.name);
+                    self.peers_by_name.write().unwrap().insert(m.name.clone(), id);
+                    self.names_by_id.write().unwrap().insert(id, m.name.clone());
+                }
+                Err(_) => warn!("mesh: member `{}` has an unparseable id", m.name),
+            }
+        }
+        self.spawn_dials();
+        let roster = self.roster();
+        for (_, (_, tx)) in self.control_txs.lock().unwrap().iter() {
+            let _ = tx.send(Msg::Roster {
+                members: roster.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Accept side of a mesh join: verify the token proof, admit the member,
+    /// and hand back the full roster.
+    async fn handle_join_accept(
+        self: &Arc<Self>,
+        conn: iroh::endpoint::Connection,
+    ) -> Result<()> {
+        let remote = conn.remote_id();
+        let (mut send, mut recv) = conn.accept_bi().await?;
+        let req: JoinRequest = read_frame(&mut recv).await?;
+        let deny = |reason: &str| JoinResponse::Denied {
+            reason: reason.to_string(),
+        };
+        let secret = *self.mesh.read().unwrap();
+        let verdict = match secret {
+            None => Err(deny("this host is not part of a mesh")),
+            Some(secret) => {
+                let expected_proof = crate::mesh::proof(
+                    &secret,
+                    remote.as_bytes(),
+                    self.endpoint.id().as_bytes(),
+                );
+                if req.mesh_id != crate::mesh::mesh_id(&secret) {
+                    Err(deny("different mesh"))
+                } else if req.proof != expected_proof {
+                    Err(deny("invalid mesh proof"))
+                } else if req.member.id != remote.to_string() {
+                    Err(deny("claimed id does not match the connection"))
+                } else if req.member.name.is_empty() || req.member.name == self.my_name {
+                    Err(deny("that name is taken by this host"))
+                } else if self
+                    .peers_by_name
+                    .read()
+                    .unwrap()
+                    .get(&req.member.name)
+                    .is_some_and(|known| *known != remote)
+                {
+                    Err(deny("that name is taken by another member"))
+                } else {
+                    Ok(())
+                }
+            }
+        };
+        let response = match verdict {
+            Err(denied) => denied,
+            Ok(()) => {
+                info!("mesh: `{}` joined via token", req.member.name);
+                self.apply_roster(std::slice::from_ref(&req.member))?;
+                JoinResponse::Welcome {
+                    members: self.roster(),
+                }
+            }
+        };
+        let denied = matches!(response, JoinResponse::Denied { .. });
+        write_frame(&mut send, &response).await?;
+        send.finish()?;
+        let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
+        if denied {
+            warn!("mesh: denied join attempt from {remote}");
+        }
+        Ok(())
+    }
+
+    /// Dial side of a mesh join (used by `mesh join` through the daemon).
+    pub async fn join_bootstrap(self: &Arc<Self>, bootstrap: &str) -> Result<String> {
+        let secret = self
+            .mesh
+            .read()
+            .unwrap()
+            .context("no mesh token in the config — run `mousefinity mesh join <ticket>`")?;
+        let id = self
+            .peers_by_name
+            .read()
+            .unwrap()
+            .get(bootstrap)
+            .copied()
+            .with_context(|| format!("unknown bootstrap peer `{bootstrap}`"))?;
+        let target = self.dial_target(bootstrap, id);
+        let me = Member {
+            name: self.my_name.clone(),
+            id: self.endpoint.id().to_string(),
+        };
+        let members = join_handshake(&self.endpoint, &secret, target, me).await?;
+        let count = members.len();
+        self.apply_roster(&members)?;
+        Ok(format!("joined mesh: {count} member(s) known"))
     }
 
     // ---- file transfer ----
@@ -429,6 +620,38 @@ impl Net {
         let _ = tokio::time::timeout(Duration::from_secs(10), conn.closed()).await;
         info!("received {}", target.display());
         Ok(())
+    }
+}
+
+/// One-shot join handshake against a bootstrap member. Standalone so the
+/// `mesh join` CLI can run it without a daemon (it binds its own endpoint).
+pub async fn join_handshake(
+    endpoint: &Endpoint,
+    secret: &[u8; 32],
+    target: EndpointAddr,
+    me: Member,
+) -> Result<Vec<Member>> {
+    let conn = endpoint
+        .connect(target, ALPN_JOIN)
+        .await
+        .context("cannot reach the bootstrap member (is it running?)")?;
+    let (mut send, mut recv) = conn.open_bi().await?;
+    let req = JoinRequest {
+        mesh_id: crate::mesh::mesh_id(secret),
+        proof: crate::mesh::proof(
+            secret,
+            endpoint.id().as_bytes(),
+            conn.remote_id().as_bytes(),
+        ),
+        member: me,
+    };
+    write_frame(&mut send, &req).await?;
+    send.finish()?;
+    let resp: JoinResponse = read_frame(&mut recv).await?;
+    conn.close(0u32.into(), b"join done");
+    match resp {
+        JoinResponse::Welcome { members } => Ok(members),
+        JoinResponse::Denied { reason } => anyhow::bail!("join denied: {reason}"),
     }
 }
 

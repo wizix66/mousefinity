@@ -46,24 +46,44 @@ cargo build --release          # produces target/release/mousefinity(.exe)
 Windows note: on the GNU toolchain, build with dependency optimization (the
 default dev profile here already does) — see `Cargo.toml`.
 
-## Setup (two machines: `desktop` and `laptop`)
+## Setup
 
-On each machine:
+The fast way is a **mesh**: one shared token, and machines discover and
+trust each other automatically.
 
 ```sh
-mousefinity init               # creates identity + config, prints pairing id
+# first machine
+mousefinity init
+mousefinity mesh init          # prints a join ticket
+
+# every additional machine
+mousefinity init --name laptop
+mousefinity mesh join mfmesh…  # the ticket from above
 ```
 
-Exchange the printed pairing ids (they are public keys — safe to share):
+Joining imports the whole roster: the new machine learns every existing
+member, existing members learn the newcomer (the roster gossips through
+the mesh), and connections form on their own. The ticket is the trust
+root — share it like a Wi-Fi password, over any private channel.
+
+<details>
+<summary>Manual pairing (no shared token)</summary>
+
+If you prefer explicit per-machine trust, exchange pairing ids instead
+(they are public keys — safe to share):
 
 ```sh
 # on desktop
-mousefinity add-peer laptop  <laptop's id>
+mousefinity add-peer laptop  <laptop's id from `mousefinity id`>
 # on laptop
 mousefinity add-peer desktop <desktop's id>
 ```
 
-Arrange the screens **on either machine** (the layout syncs to every
+Manually paired machines are not mesh members: they never accept roster
+gossip, so nothing gets added to their trust list behind their back.
+</details>
+
+Arrange the screens **on any machine** (the layout syncs to every
 connected peer automatically — newest edit wins):
 
 ```sh
@@ -312,35 +332,73 @@ side's failures tell you what *that* network blocks.
 
 ### Self-hosting a relay
 
-For networks where n0's public relays are blocked (or for full
-independence), run [iroh-relay](https://github.com/n0-computer/iroh) on any
-server both sides can reach over TCP 443:
+For networks where n0's public relays are blocked, or for full
+independence, run your own relay. Every release ships it:
+`mousefinity-relay-<version>-<target>.tar.gz` contains the `iroh-relay`
+server binary (pinned to the same iroh version mousefinity uses), a
+commented `relay.example.toml`, and a hardened systemd unit.
+
+**Relay requirements**
+
+| | |
+| --- | --- |
+| Server | any always-on box every host can reach — a $5 VPS is plenty (relay load is one cursor stream + occasional files; ~tens of MB RAM) |
+| DNS | a hostname pointing at the server (needed for the TLS certificate) |
+| Inbound ports | TCP **443** (relay + TLS), TCP **80** (LetsEncrypt HTTP-01 renewal), UDP **7842** (QUIC address discovery — optional but improves hole-punching) |
+| TLS | automatic via LetsEncrypt (`cert_mode = "LetsEncrypt"`), or bring your own cert (`"Manual"`) |
+
+**Install & configure** (Linux server):
 
 ```sh
-cargo install iroh-relay --features server
-iroh-relay --dev            # dev mode; for production use TLS on 443
+tar xzf mousefinity-relay-<version>-x86_64-unknown-linux-gnu.tar.gz
+cd mousefinity-relay-*
+sudo cp iroh-relay /usr/local/bin/
+sudo mkdir -p /etc/iroh-relay
+sudo cp relay.example.toml /etc/iroh-relay/config.toml
+sudoedit /etc/iroh-relay/config.toml    # set hostname, contact, allowlist
+sudo cp iroh-relay.service /etc/systemd/system/
+sudo systemctl enable --now iroh-relay
 ```
 
-Production wants a TLS certificate (Let's Encrypt) and inbound TCP 443
-open on the server — see the iroh-relay docs for the config file. Then on
-**every** mousefinity host:
+The three lines to edit in the config: `hostname` (your relay's DNS name),
+`contact` (LetsEncrypt email), and — strongly recommended —
+`access.allowlist` with the pairing ids of your machines, so strangers
+cannot burn your bandwidth. Quick smoke test without TLS/domain:
+`iroh-relay --dev` (plain HTTP on port 3340; fine for a first LAN try,
+not for production).
+
+Then on **every** mousefinity host:
 
 ```toml
 [network]
 relay = "https://relay.your-domain.com"
 ```
 
-Traffic through your relay is still end-to-end encrypted; the relay sees
-only ciphertext, and only your machines' keys can use your mousefinity
-peers — but note anyone who can reach an open relay can use it to carry
-their own iroh traffic, so restrict it (firewall allowlists or
-`access_control` in the relay config) if that matters to you.
+With a shared custom relay, mousefinity dials peers through it directly —
+no DNS/mDNS discovery needed — so the only thing a corporate network must
+allow is outbound TCP 443 to your domain. Traffic stays end-to-end
+encrypted: your relay only ever sees ciphertext, and even an open relay
+never lets outsiders into your mousefinity mesh (peers authenticate each
+other by key) — the allowlist just stops freeloading.
 
 ## Security model
 
 - Identity = Ed25519 keypair, generated at `init`, never leaves the machine.
-- Peering is explicit and mutual: each side must `add-peer` the other's
-  public key. Unknown keys are rejected before any application data flows.
+- Trust comes in exactly two forms, both local decisions:
+  - **Manual peering** — each side must `add-peer` the other's public key.
+  - **Mesh membership** — every holder of the mesh token is trusted.
+    Membership is proven with a keyed BLAKE3 hash bound to the two
+    authenticated endpoint ids of the connection: the token never crosses
+    the wire, and a proof cannot be replayed for any other machine pair.
+  Unknown keys are rejected before any application data flows.
+- **Tenancy is cryptographic, not relay configuration.** A relay (public,
+  or self-hosted and shared with other people) only ever forwards
+  ciphertext between endpoint ids — it cannot see, join, or enumerate your
+  mesh. Two meshes on the same relay have different tokens, so their
+  members are mutually invisible: a join attempt with the wrong token is
+  rejected by the *member*, not the relay.
+- Roster gossip only flows between token holders; manually paired machines
+  never accept it.
 - All traffic (input, clipboard, files) rides TLS-1.3-encrypted QUIC;
   relays only ever see ciphertext.
 - Received files: only the file *name* is honoured, never a path; name
@@ -361,6 +419,10 @@ their own iroh traffic, so restrict it (firewall allowlists or
   your primary monitor and prefer hop edges not covered by a second monitor.
 - Modifier state is not re-synchronized across a hop; release modifiers
   before hopping.
+- Mesh trust is all-or-nothing per token: anyone with the ticket can join,
+  and evicting a machine currently means removing it from `[peers]` on each
+  host and creating a fresh mesh (`mesh_secret` in the config) — a
+  `mesh rotate` command is planned.
 - Android/iOS shells are not implemented yet (see the support matrix).
 
 ## License

@@ -26,6 +26,8 @@ serde_json = "1.0.150"
 iroh-mdns-address-lookup = "0.4.0"
 ratatui = "0.30.2"
 rustls-native-certs = "0.8.4"
+blake3 = "1.8.5"
+postcard = "1.1.3"
 
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_UI_HiDpi"] }

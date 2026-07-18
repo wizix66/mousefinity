@@ -2667,10 +2667,11 @@ dependencies = [
 
 [[package]]
 name = "mousefinity"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arboard",
+ "blake3",
  "clap",
  "data-encoding",
  "dirs",
@@ -2678,6 +2679,7 @@ dependencies = [
  "iroh",
  "iroh-mdns-address-lookup",
  "mousefinity-proto",
+ "postcard",
  "rand 0.10.2",
  "ratatui",
  "rdev",
@@ -2693,7 +2695,7 @@ dependencies = [
 
 [[package]]
 name = "mousefinity-proto"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "postcard",
  "serde",

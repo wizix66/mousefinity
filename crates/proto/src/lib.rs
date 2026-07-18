@@ -7,12 +7,14 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Protocol version. Bump on incompatible changes; peers refuse mismatches.
-pub const PROTO_VERSION: u16 = 1;
+pub const PROTO_VERSION: u16 = 2;
 
 /// ALPN for the long-lived control/input connection between paired hosts.
 pub const ALPN_CONTROL: &[u8] = b"mousefinity/ctl/1";
 /// ALPN for one-shot file transfer connections.
 pub const ALPN_FILE: &[u8] = b"mousefinity/file/1";
+/// ALPN for one-shot mesh join handshakes (token-authenticated pairing).
+pub const ALPN_JOIN: &[u8] = b"mousefinity/join/1";
 
 /// Hard cap for a single framed message (clipboard is chunk-limited below this).
 pub const MAX_FRAME: u32 = 8 * 1024 * 1024;
@@ -186,6 +188,44 @@ pub enum Msg {
     /// adopt strictly newer revisions, persist them, and gossip them onward,
     /// so a `link`/TUI edit on any machine reaches every connected peer.
     Layout { rev: u64, layout: Layout },
+    /// Mesh roster gossip: every member the sender knows about. Receivers
+    /// take the union, persist newcomers as trusted peers, and re-gossip on
+    /// change, so a joining machine becomes reachable mesh-wide. Only sent
+    /// between hosts that share a mesh token.
+    Roster { members: Vec<Member> },
+}
+
+/// One mesh member: layout/config name plus its pairing id (hex).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Member {
+    pub name: String,
+    pub id: String,
+}
+
+/// First frame on an `ALPN_JOIN` connection.
+///
+/// `proof` must be the keyed hash of both connection endpoints' ids under
+/// the mesh secret (see the `mesh` module in the daemon), which shows the
+/// dialer holds the mesh token without revealing it; the underlying QUIC
+/// connection already authenticates both ids, so the proof cannot be
+/// replayed for any other pair of machines.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JoinRequest {
+    /// Public identifier of the mesh (hash of the secret).
+    pub mesh_id: [u8; 32],
+    /// Keyed hash binding the token to this connection's two endpoint ids.
+    pub proof: [u8; 32],
+    /// Who is joining.
+    pub member: Member,
+}
+
+/// Reply to a [`JoinRequest`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum JoinResponse {
+    /// Wrong mesh, bad proof, or a name conflict; the reason is human-readable.
+    Denied { reason: String },
+    /// Joined: the full roster as the accepting member knows it.
+    Welcome { members: Vec<Member> },
 }
 
 /// Header for a file transfer connection (`ALPN_FILE`). Sent framed, then the

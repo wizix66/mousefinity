@@ -58,6 +58,7 @@ pub fn run() -> Result<()> {
         screen: None,
         downloads: None,
         network: Default::default(),
+        mesh_secret: None,
         peers: Default::default(),
         layout: Default::default(),
         layout_rev: 0,
