@@ -57,6 +57,7 @@ pub fn run() -> Result<()> {
         name: crate::host_name(),
         screen: None,
         downloads: None,
+        network: Default::default(),
         peers: Default::default(),
         layout: Default::default(),
         layout_rev: 0,
@@ -246,7 +247,13 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<bool> 
                 match id.parse::<iroh::EndpointId>() {
                     Ok(_) => {
                         let name = app.input_name.trim().to_string();
-                        app.cfg.peers.insert(name.clone(), config::Peer { id });
+                        app.cfg.peers.insert(
+                            name.clone(),
+                            config::Peer {
+                                id,
+                                addrs: vec![],
+                            },
+                        );
                         app.status = format!("added peer `{name}` — press s to save");
                         app.input_name.clear();
                         app.input_id.clear();

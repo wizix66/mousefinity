@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use iroh::endpoint::presets;
-use iroh::{Endpoint, EndpointId, SecretKey};
+use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use mousefinity_proto::{
     read_frame, write_frame, FileOffer, Msg, ALPN_CONTROL, ALPN_FILE, PROTO_VERSION,
 };
@@ -27,6 +27,8 @@ pub struct Net {
     my_screen: (u32, u32),
     peers_by_name: RwLock<HashMap<String, EndpointId>>,
     names_by_id: RwLock<HashMap<EndpointId, String>>,
+    /// Static socket addresses per peer, tried alongside discovery results.
+    static_addrs: RwLock<HashMap<String, Vec<std::net::SocketAddr>>>,
     /// Peer names that currently have a live dial task.
     dialing: Mutex<HashSet<String>>,
     engine_tx: UnboundedSender<EngineIn>,
@@ -34,11 +36,16 @@ pub struct Net {
     downloads: PathBuf,
 }
 
-fn parse_peers(
-    cfg: &Config,
-) -> Result<(HashMap<String, EndpointId>, HashMap<EndpointId, String>)> {
+type PeerMaps = (
+    HashMap<String, EndpointId>,
+    HashMap<EndpointId, String>,
+    HashMap<String, Vec<std::net::SocketAddr>>,
+);
+
+fn parse_peers(cfg: &Config) -> Result<PeerMaps> {
     let mut by_name = HashMap::new();
     let mut by_id = HashMap::new();
+    let mut statics = HashMap::new();
     for (name, peer) in &cfg.peers {
         let id: EndpointId = peer
             .id
@@ -46,8 +53,17 @@ fn parse_peers(
             .with_context(|| format!("peer `{name}` has an invalid id"))?;
         by_name.insert(name.clone(), id);
         by_id.insert(id, name.clone());
+        if !peer.addrs.is_empty() {
+            let mut socks = Vec::new();
+            for a in &peer.addrs {
+                socks.push(a.parse::<std::net::SocketAddr>().with_context(|| {
+                    format!("peer `{name}`: `{a}` is not a valid ip:port address")
+                })?);
+            }
+            statics.insert(name.clone(), socks);
+        }
     }
-    Ok((by_name, by_id))
+    Ok((by_name, by_id, statics))
 }
 
 impl Net {
@@ -57,14 +73,44 @@ impl Net {
         my_screen: (u32, u32),
         engine_tx: UnboundedSender<EngineIn>,
     ) -> Result<Arc<Self>> {
-        let (peers_by_name, names_by_id) = parse_peers(cfg)?;
-        let endpoint = Endpoint::builder(presets::N0)
+        let (peers_by_name, names_by_id, static_addrs) = parse_peers(cfg)?;
+        let relay_off = cfg.network.relay.as_deref() == Some("off");
+        let mut builder = if relay_off {
+            // Direct connections only: no relay servers are ever contacted.
+            Endpoint::builder(presets::N0DisableRelay)
+        } else {
+            Endpoint::builder(presets::N0)
+        };
+        builder = builder
             .secret_key(SecretKey::from_bytes(&secret))
             .alpns(vec![ALPN_CONTROL.to_vec(), ALPN_FILE.to_vec()])
-            // Besides the internet-wide relay/DNS discovery from the N0
-            // preset, advertise and resolve peers directly on the local
-            // network so LAN setups work even with filtered DNS.
+            // Advertise and resolve peers directly on the local network:
+            // same-LAN hosts find each other with zero internet access.
             .address_lookup(iroh_mdns_address_lookup::MdnsAddressLookup::builder())
+            // Resolve discovery records over HTTPS as well as DNS, for
+            // networks that filter TXT lookups (common on corporate nets).
+            .address_lookup(iroh::address_lookup::PkarrResolver::n0_dns());
+        // Trust the OS certificate store in addition to the built-in webpki
+        // roots, so relay connections survive corporate TLS-inspection
+        // proxies whose root CA is installed on this machine. (The full
+        // platform verifier is NOT used: on Windows it rejects the relays'
+        // trailing-dot hostnames with NotValidForName.)
+        let native = rustls_native_certs::load_native_certs();
+        if !native.certs.is_empty() {
+            builder = builder.ca_tls_config(
+                iroh::tls::CaTlsConfig::default().with_extra_roots(native.certs),
+            );
+        }
+        if let Some(port) = cfg.network.port.filter(|p| *p != 0) {
+            builder = builder
+                .bind_addr(std::net::SocketAddr::from((
+                    std::net::Ipv4Addr::UNSPECIFIED,
+                    port,
+                )))
+                .context("invalid fixed port")?;
+            info!("listening on fixed udp port {port}");
+        }
+        let endpoint = builder
             .bind()
             .await
             .context("failed to bind iroh endpoint")?;
@@ -74,6 +120,7 @@ impl Net {
             my_screen,
             peers_by_name: RwLock::new(peers_by_name),
             names_by_id: RwLock::new(names_by_id),
+            static_addrs: RwLock::new(static_addrs),
             dialing: Mutex::new(HashSet::new()),
             engine_tx,
             epoch: AtomicU64::new(0),
@@ -89,10 +136,11 @@ impl Net {
     /// newly added peers, and hand the (possibly newer) layout to the engine.
     pub fn reload(self: &Arc<Self>) -> Result<String> {
         let cfg = crate::config::load()?;
-        let (by_name, by_id) = parse_peers(&cfg)?;
+        let (by_name, by_id, statics) = parse_peers(&cfg)?;
         let n = by_name.len();
         *self.peers_by_name.write().unwrap() = by_name;
         *self.names_by_id.write().unwrap() = by_id;
+        *self.static_addrs.write().unwrap() = statics;
         self.spawn_dials();
         let _ = self.engine_tx.send(EngineIn::SetLayout {
             rev: cfg.layout_rev,
@@ -164,6 +212,19 @@ impl Net {
         }
     }
 
+    /// Dial target for a peer: its id plus any statically configured
+    /// addresses. iroh races these against discovery results and the relay
+    /// path, so static LAN/VPN routes win whenever they are reachable.
+    fn dial_target(&self, name: &str, id: EndpointId) -> EndpointAddr {
+        let mut addr = EndpointAddr::new(id);
+        if let Some(socks) = self.static_addrs.read().unwrap().get(name) {
+            for s in socks {
+                addr = addr.with_ip_addr(*s);
+            }
+        }
+        addr
+    }
+
     async fn dial_loop(self: Arc<Self>, name: String) {
         loop {
             // Re-resolve each round so a reload can retarget or retire us.
@@ -172,7 +233,8 @@ impl Net {
             if self.endpoint.id().as_bytes() >= id.as_bytes() {
                 break; // after a re-pair the other side dials now
             }
-            match self.endpoint.connect(id, ALPN_CONTROL).await {
+            let target = self.dial_target(&name, id);
+            match self.endpoint.connect(target, ALPN_CONTROL).await {
                 Ok(conn) => {
                     info!("connected to {name}");
                     if let Err(e) = self.handle_control(name.clone(), conn, true).await {
@@ -279,7 +341,8 @@ impl Net {
             .context("path has no file name")?
             .to_string_lossy()
             .into_owned();
-        let conn = self.endpoint.connect(id, ALPN_FILE).await?;
+        let target = self.dial_target(peer, id);
+        let conn = self.endpoint.connect(target, ALPN_FILE).await?;
         let (mut send, mut recv) = conn.open_bi().await?;
         write_frame(
             &mut send,

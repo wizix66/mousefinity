@@ -12,6 +12,24 @@ pub struct Peer {
     /// The peer's iroh endpoint id (its public key), as printed by
     /// `mousefinity id` on that machine.
     pub id: String,
+    /// Optional static addresses (`"ip:port"`) tried in addition to anything
+    /// discovery finds. Lets routed LANs and firewall-allowlisted setups
+    /// connect with no discovery infrastructure at all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addrs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Network {
+    /// Fixed UDP port to listen on (IPv4, all interfaces). Makes inbound
+    /// firewall rules and peers' static `addrs` entries possible.
+    /// Absent or 0 = ephemeral port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// Set to "off" to never use public relay servers: LAN/VPN-only
+    /// operation, direct connections only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,6 +42,9 @@ pub struct Config {
     /// Where received files land. Defaults to `<Downloads>/mousefinity`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub downloads: Option<PathBuf>,
+    /// Network tuning (fixed port, relay policy).
+    #[serde(default, skip_serializing_if = "is_default_network")]
+    pub network: Network,
     /// Trusted peers by name. Only these may connect.
     #[serde(default)]
     pub peers: BTreeMap<String, Peer>,
@@ -47,6 +68,10 @@ impl Config {
                 .join("mousefinity")
         })
     }
+}
+
+fn is_default_network(n: &Network) -> bool {
+    n.port.is_none() && n.relay.is_none()
 }
 
 pub fn config_dir() -> Result<PathBuf> {

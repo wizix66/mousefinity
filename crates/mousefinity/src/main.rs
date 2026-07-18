@@ -108,6 +108,7 @@ fn cmd_init(name: Option<String>) -> Result<()> {
             name: name.unwrap_or_else(host_name),
             screen: None,
             downloads: None,
+            network: Default::default(),
             peers: Default::default(),
             layout: Default::default(),
             layout_rev: 0,
@@ -138,7 +139,7 @@ fn cmd_add_peer(name: String, id: String) -> Result<()> {
         bail!("`{name}` is this host's own name");
     }
     cfg.peers
-        .insert(name.clone(), config::Peer { id });
+        .insert(name.clone(), config::Peer { id, addrs: vec![] });
     config::save(&cfg)?;
     println!("added peer `{name}`");
     Ok(())

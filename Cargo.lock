@@ -2681,6 +2681,7 @@ dependencies = [
  "rand 0.10.2",
  "ratatui",
  "rdev",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "tokio",

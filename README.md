@@ -103,8 +103,15 @@ name = "desktop"
 # screen = [2560, 1440]        # override auto-detected size if needed
 # downloads = "D:/incoming"    # where received files land
 
+[network]                      # optional section
+port = 48800                   # fixed UDP listen port (firewall rules, static addrs)
+# relay = "off"                # never touch public relays: direct/LAN only
+
 [peers.laptop]
 id = "3fa9…"                   # from `mousefinity id` on that machine
+# static addresses to try in addition to discovery — for routed LANs,
+# VPNs, or firewall-allowlisted setups; needs a fixed port on that peer
+addrs = ["192.168.1.50:48800", "10.8.0.2:48800"]
 
 [layout.desktop]
 right = "laptop"
@@ -145,27 +152,139 @@ AccessibilityService / Swift app) that hosts them. This is the documented
 path, not a hidden limitation: **no** third-party tool can inject
 system-wide input on stock iOS.
 
-## How it works
+## Requirements
 
-- **Transport** — [iroh](https://github.com/n0-computer/iroh) QUIC endpoints.
-  Each host publishes its (relay, address) info under its public key;
-  connections authenticate both ends by key during the TLS handshake and
-  hole-punch a direct UDP path, falling back to the encrypted relay.
-- **Capture** — a low-level hook (`rdev::grab`) sees every input event. While
-  the virtual cursor is on a remote screen all events are swallowed locally
-  and forwarded; the physical cursor is parked at the screen centre so each
-  hook event yields a clean relative delta.
-- **Focus model** — the machine with the physical input is authoritative: it
-  tracks the virtual cursor across every screen in the layout (it learns each
-  peer's resolution at handshake), decides edge hops, and streams absolute
-  positions to whichever peer is focused. Controlled peers never make hop
-  decisions, which prevents feedback loops from injected events.
-- **Clipboard** — pushed to the peer you hop to; handed back when you leave.
-- **Files** — a separate QUIC connection per transfer (`ALPN mousefinity/file/1`),
-  streamed with backpressure; receivers only ever write inside their
-  downloads directory (path components are stripped).
-- **`send` CLI** — talks to the running daemon over token-authenticated
-  loopback IPC, so transfers reuse the daemon's identity and connections.
+| | Build | Run |
+| --- | --- | --- |
+| Windows | Rust stable (MSVC or GNU toolchain) | Windows 10+; first run may show a Defender Firewall prompt — allowing it is recommended but *outgoing* control of other machines works even without it |
+| macOS | Rust stable + Xcode CLT | macOS 10.15+; grant **Accessibility** and **Input Monitoring** to the binary (System Settings → Privacy & Security) |
+| Linux (X11) | Rust stable, `libx11-dev libxtst-dev libxi-dev libevdev-dev libxdo-dev` | X11 session; user in the `input` group for capture |
+| Network | — | Outbound UDP + outbound TCP 443 (see [ports](#ports--firewalls)); no port forwarding, no inbound rules required in the common case |
+
+## Architecture
+
+Every host runs the same daemon; there is no server role. Inside one host:
+
+```mermaid
+flowchart LR
+    subgraph host["mousefinity daemon (one per host)"]
+        CAP["capture<br/>(low-level input hook)"] -->|events| ENG["engine<br/>(virtual cursor,<br/>focus state, hops)"]
+        ENG -->|inject commands| INJ["inject<br/>(synthetic input)"]
+        ENG <-->|msgs| NET["net<br/>(iroh QUIC endpoint)"]
+        ENG <--> CLIP["clipboard"]
+        IPC["ipc (loopback,<br/>token-authed)"] --> NET
+    end
+    CLI["mousefinity send / link / tui"] --> IPC
+    NET <-->|"encrypted QUIC<br/>(direct or relayed)"| PEERS(("paired peers"))
+```
+
+The machine with the physical mouse is **authoritative**: it tracks the
+virtual cursor across every screen in the layout (learning each peer's
+resolution at handshake), decides edge hops, and streams absolute positions
+to whichever peer is focused. Controlled peers never make hop decisions,
+which prevents feedback loops from injected events.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Local
+    Local --> Remote_B : cursor touches an edge<br/>with neighbour B connected
+    Remote_B --> Local : virtual cursor crosses<br/>back onto this host
+    Remote_B --> Remote_C : chained hop across<br/>B's far edge
+    Remote_C --> Local : ScrollLock (panic key)<br/>or peer disconnect
+    Remote_B --> Local : ScrollLock (panic key)<br/>or peer disconnect
+```
+
+While remote, all local input is swallowed and forwarded; the physical
+cursor parks at the screen centre so every hook event yields a clean
+relative delta. Clipboard is pushed to the peer you hop to and handed back
+when you leave. File transfers use a separate QUIC connection per transfer
+(`ALPN mousefinity/file/1`), streamed with backpressure; receivers only
+ever write inside their downloads directory (path components stripped).
+
+## Networking: how peers find each other
+
+Connection setup is **LAN-first by construction**: every candidate path is
+discovered and raced concurrently, and the connection migrates to the best
+(lowest-latency) working path — a same-LAN direct route beats everything
+else, and the relay is only used while no direct path works.
+
+```mermaid
+sequenceDiagram
+    participant A as host A
+    participant M as mDNS (local network)
+    participant D as discovery (DNS + HTTPS pkarr)
+    participant R as relay (TLS 443)
+    participant B as host B
+    Note over A,B: both daemons publish: all local interface IPs,<br/>observed public address, home relay
+    A->>M: who has B's key? (zero internet needed)
+    A->>D: lookup B's key (TXT record, HTTPS fallback)
+    M-->>A: B's LAN addresses
+    D-->>A: B's addresses + relay
+    par race all candidates
+        A->>B: QUIC to LAN / routed private IPs
+    and
+        A->>B: QUIC to public address (hole-punch)
+    and
+        A->>R: QUIC via relay
+        R->>B: forward (still end-to-end encrypted)
+    end
+    Note over A,B: first working path carries traffic;<br/>connection migrates to the best direct path
+```
+
+Details that matter for your network:
+
+- **All local IPs are advertised.** Each daemon publishes every interface
+  address it has (Ethernet, Wi-Fi, VPN…) both via mDNS on the local network
+  and in its discovery record. Two sites with routed private networks
+  (e.g. an IPsec/WireGuard tunnel between LANs) connect directly across the
+  tunnel without any special configuration.
+- **mDNS works with zero internet.** Two laptops on the same switch pair
+  and work with the internet cable unplugged (`relay = "off"` makes that a
+  guarantee rather than a fallback).
+- **Static addresses beat discovery.** `addrs = ["ip:port"]` under a peer
+  pins known routes (fixed office IP, VPN address). Combined with
+  `network.port` on the other side, two hosts connect with no discovery
+  infrastructure at all.
+- **Discovery survives DNS filtering.** Records are resolved via DNS *and*
+  via HTTPS (pkarr relay), so networks that block TXT lookups still work.
+
+## Ports & firewalls
+
+**The common case needs no inbound rules and no port forwarding.** All flows
+below are outbound; stateful firewalls allow the replies automatically.
+
+| Direction | Protocol / port | Purpose | Needed when |
+| --- | --- | --- | --- |
+| outbound | UDP, high ports | QUIC to peers (direct paths) + relay QAD probes | always (unless `relay="off"` and UDP blocked → nothing works) |
+| outbound | TCP 443 (TLS) | relay connection + HTTPS discovery fallback | internet-crossing setups, UDP-hostile networks |
+| outbound | UDP 53 / DoH | DNS discovery lookups | internet-crossing setups (HTTPS fallback exists) |
+| local multicast | UDP 5353 (mDNS) | LAN peer discovery | same-LAN discovery |
+| inbound (optional) | UDP `network.port` | direct connections from peers using static `addrs` | only for pinned/allowlisted setups |
+
+Playbook, from easiest to most locked-down:
+
+1. **Home / office LAN** — nothing to do. mDNS finds peers; direct QUIC on
+   the LAN carries everything.
+2. **Across the internet, normal NAT (home router)** — nothing to do.
+   Hole-punching establishes a direct path in the common case; otherwise
+   traffic rides the relay (encrypted end to end — relays only ever see
+   ciphertext).
+3. **One or both hosts behind corporate/strict firewalls** — outbound-only
+   firewalls still work: hole-punching makes *both* flows outbound-initiated,
+   and if UDP is blocked entirely the relay path over TCP 443 carries
+   traffic (with some added latency). If the network also filters DNS, the
+   HTTPS discovery fallback covers it. For the best odds on Windows, allow
+   the app when Defender Firewall prompts (or add an inbound UDP rule for a
+   fixed `network.port`) — this lets direct paths form even when the peer's
+   first packet arrives before yours leaves.
+4. **Both sites are locked down but route to each other** (site-to-site VPN,
+   MPLS, tailnet): set `network.port` on both, list each other's private
+   IPs in `addrs`, and optionally `relay = "off"` — fully self-contained
+   operation with no third-party infrastructure.
+5. **Nothing works?** The relay servers are the ones from
+   [iroh](https://iroh.computer) (n0). You can self-host both a relay and a
+   pkarr/DNS server inside your own perimeter and point iroh at them —
+   open an issue and I'll wire up config for custom relay URLs.
 
 ## Security model
 
