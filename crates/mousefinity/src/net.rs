@@ -29,6 +29,8 @@ pub struct Net {
     names_by_id: RwLock<HashMap<EndpointId, String>>,
     /// Static socket addresses per peer, tried alongside discovery results.
     static_addrs: RwLock<HashMap<String, Vec<std::net::SocketAddr>>>,
+    /// Self-hosted relay all peers share, when `[network] relay` is a URL.
+    custom_relay: Option<iroh::RelayUrl>,
     /// Peer names that currently have a live dial task.
     dialing: Mutex<HashSet<String>>,
     engine_tx: UnboundedSender<EngineIn>,
@@ -66,6 +68,66 @@ fn parse_peers(cfg: &Config) -> Result<PeerMaps> {
     Ok((by_name, by_id, statics))
 }
 
+/// Build and bind the iroh endpoint per the config's network policy.
+/// Returns the endpoint plus the custom relay URL, if one is configured.
+pub async fn bind_endpoint(
+    cfg: &Config,
+    secret: [u8; 32],
+) -> Result<(Endpoint, Option<iroh::RelayUrl>)> {
+    let relay_setting = cfg.network.relay.as_deref();
+    let mut custom_relay: Option<iroh::RelayUrl> = None;
+    let mut builder = if relay_setting == Some("off") {
+        // Direct connections only: no relay servers are ever contacted.
+        Endpoint::builder(presets::N0DisableRelay)
+    } else {
+        Endpoint::builder(presets::N0)
+    };
+    builder = builder
+        .secret_key(SecretKey::from_bytes(&secret))
+        .alpns(vec![ALPN_CONTROL.to_vec(), ALPN_FILE.to_vec()])
+        // Advertise and resolve peers directly on the local network:
+        // same-LAN hosts find each other with zero internet access.
+        .address_lookup(iroh_mdns_address_lookup::MdnsAddressLookup::builder())
+        // Resolve discovery records over HTTPS as well as DNS, for
+        // networks that filter TXT lookups (common on corporate nets).
+        .address_lookup(iroh::address_lookup::PkarrResolver::n0_dns());
+    if let Some(r) = relay_setting {
+        if r != "off" && r != "auto" {
+            // Self-hosted relay: use it exclusively, and remember it so
+            // dials can target peers on it without any discovery.
+            let url: iroh::RelayUrl = r
+                .parse()
+                .with_context(|| format!("[network] relay = \"{r}\" is not a valid url"))?;
+            custom_relay = Some(url.clone());
+            builder = builder.relay_mode(iroh::RelayMode::Custom(iroh::RelayMap::from(url)));
+        }
+    }
+    // Trust the OS certificate store in addition to the built-in webpki
+    // roots, so relay connections survive corporate TLS-inspection
+    // proxies whose root CA is installed on this machine. (The full
+    // platform verifier is NOT used: on Windows it rejects the relays'
+    // trailing-dot hostnames with NotValidForName.)
+    let native = rustls_native_certs::load_native_certs();
+    if !native.certs.is_empty() {
+        builder = builder
+            .ca_tls_config(iroh::tls::CaTlsConfig::default().with_extra_roots(native.certs));
+    }
+    if let Some(port) = cfg.network.port.filter(|p| *p != 0) {
+        builder = builder
+            .bind_addr(std::net::SocketAddr::from((
+                std::net::Ipv4Addr::UNSPECIFIED,
+                port,
+            )))
+            .context("invalid fixed port")?;
+        info!("listening on fixed udp port {port}");
+    }
+    let endpoint = builder
+        .bind()
+        .await
+        .context("failed to bind iroh endpoint")?;
+    Ok((endpoint, custom_relay))
+}
+
 impl Net {
     pub async fn bind(
         cfg: &Config,
@@ -74,46 +136,7 @@ impl Net {
         engine_tx: UnboundedSender<EngineIn>,
     ) -> Result<Arc<Self>> {
         let (peers_by_name, names_by_id, static_addrs) = parse_peers(cfg)?;
-        let relay_off = cfg.network.relay.as_deref() == Some("off");
-        let mut builder = if relay_off {
-            // Direct connections only: no relay servers are ever contacted.
-            Endpoint::builder(presets::N0DisableRelay)
-        } else {
-            Endpoint::builder(presets::N0)
-        };
-        builder = builder
-            .secret_key(SecretKey::from_bytes(&secret))
-            .alpns(vec![ALPN_CONTROL.to_vec(), ALPN_FILE.to_vec()])
-            // Advertise and resolve peers directly on the local network:
-            // same-LAN hosts find each other with zero internet access.
-            .address_lookup(iroh_mdns_address_lookup::MdnsAddressLookup::builder())
-            // Resolve discovery records over HTTPS as well as DNS, for
-            // networks that filter TXT lookups (common on corporate nets).
-            .address_lookup(iroh::address_lookup::PkarrResolver::n0_dns());
-        // Trust the OS certificate store in addition to the built-in webpki
-        // roots, so relay connections survive corporate TLS-inspection
-        // proxies whose root CA is installed on this machine. (The full
-        // platform verifier is NOT used: on Windows it rejects the relays'
-        // trailing-dot hostnames with NotValidForName.)
-        let native = rustls_native_certs::load_native_certs();
-        if !native.certs.is_empty() {
-            builder = builder.ca_tls_config(
-                iroh::tls::CaTlsConfig::default().with_extra_roots(native.certs),
-            );
-        }
-        if let Some(port) = cfg.network.port.filter(|p| *p != 0) {
-            builder = builder
-                .bind_addr(std::net::SocketAddr::from((
-                    std::net::Ipv4Addr::UNSPECIFIED,
-                    port,
-                )))
-                .context("invalid fixed port")?;
-            info!("listening on fixed udp port {port}");
-        }
-        let endpoint = builder
-            .bind()
-            .await
-            .context("failed to bind iroh endpoint")?;
+        let (endpoint, custom_relay) = bind_endpoint(cfg, secret).await?;
         Ok(Arc::new(Self {
             endpoint,
             my_name: cfg.name.clone(),
@@ -121,6 +144,7 @@ impl Net {
             peers_by_name: RwLock::new(peers_by_name),
             names_by_id: RwLock::new(names_by_id),
             static_addrs: RwLock::new(static_addrs),
+            custom_relay,
             dialing: Mutex::new(HashSet::new()),
             engine_tx,
             epoch: AtomicU64::new(0),
@@ -221,6 +245,11 @@ impl Net {
             for s in socks {
                 addr = addr.with_ip_addr(*s);
             }
+        }
+        // With a shared self-hosted relay, peers are reachable through it
+        // even when every discovery mechanism is blocked.
+        if let Some(url) = &self.custom_relay {
+            addr = addr.with_relay_url(url.clone());
         }
         addr
     }

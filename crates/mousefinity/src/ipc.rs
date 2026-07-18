@@ -139,6 +139,20 @@ fn client_request(cmd: &str, peer: &str, path: &str) -> Result<Response> {
     serde_json::from_str(resp_line.trim()).context("daemon returned an unreadable response")
 }
 
+/// True if a daemon's IPC endpoint answers on this machine.
+pub fn daemon_reachable() -> bool {
+    (|| -> Result<bool> {
+        let raw = std::fs::read(info_path()?)?;
+        let info: IpcInfo = serde_json::from_slice(&raw)?;
+        Ok(std::net::TcpStream::connect_timeout(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], info.port)),
+            std::time::Duration::from_millis(300),
+        )
+        .is_ok())
+    })()
+    .unwrap_or(false)
+}
+
 /// Tell a running daemon to re-read its config. Returns its status message.
 pub fn client_reload() -> Result<String> {
     let resp = client_request("reload", "", "")?;

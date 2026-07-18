@@ -106,6 +106,7 @@ name = "desktop"
 [network]                      # optional section
 port = 48800                   # fixed UDP listen port (firewall rules, static addrs)
 # relay = "off"                # never touch public relays: direct/LAN only
+# relay = "https://relay.example.com"   # self-hosted relay (same on every host)
 
 [peers.laptop]
 id = "3fa9…"                   # from `mousefinity id` on that machine
@@ -281,10 +282,59 @@ Playbook, from easiest to most locked-down:
    MPLS, tailnet): set `network.port` on both, list each other's private
    IPs in `addrs`, and optionally `relay = "off"` — fully self-contained
    operation with no third-party infrastructure.
-5. **Nothing works?** The relay servers are the ones from
-   [iroh](https://iroh.computer) (n0). You can self-host both a relay and a
-   pkarr/DNS server inside your own perimeter and point iroh at them —
-   open an issue and I'll wire up config for custom relay URLs.
+5. **Public relays unreachable?** Self-host one and point every host at it
+   (see below). With a shared custom relay, peers are dialed *through that
+   relay directly* — no discovery infrastructure is needed at all, so this
+   also survives fully filtered DNS.
+
+### Diagnosing a connection: `mousefinity doctor`
+
+When two hosts won't link up, run this on each of them:
+
+```text
+$ mousefinity doctor
+mousefinity doctor — host `alpha`
+  pairing id: b754…
+  [ ok ] bind: endpoint up
+  [ ok ] udp egress: works (ipv4: true, ipv6: false) — direct paths & hole-punching possible
+  [ ok ] public address: 99.243.139.221:48800 (ipv4)
+  [ ok ] relay: reachable, closest: https://use1-1.relay.n0.iroh.link./
+  [ ok ] home relay: connected to https://use1-1.relay.n0.iroh.link./
+  [ ok ] peer beta: connected & mutually paired — direct ip:10.10.10.167:62896 rtt 663µs *active*
+```
+
+It checks, in order: outbound UDP (can direct paths exist at all?), NAT
+type (symmetric NATs defeat hole-punching), captive portals, relay
+reachability incl. TLS errors (spot TLS-inspecting proxies here), and then
+actually connects to every configured peer, reporting whether the working
+path is **direct** or **relay** and its latency. Run it on both ends: each
+side's failures tell you what *that* network blocks.
+
+### Self-hosting a relay
+
+For networks where n0's public relays are blocked (or for full
+independence), run [iroh-relay](https://github.com/n0-computer/iroh) on any
+server both sides can reach over TCP 443:
+
+```sh
+cargo install iroh-relay --features server
+iroh-relay --dev            # dev mode; for production use TLS on 443
+```
+
+Production wants a TLS certificate (Let's Encrypt) and inbound TCP 443
+open on the server — see the iroh-relay docs for the config file. Then on
+**every** mousefinity host:
+
+```toml
+[network]
+relay = "https://relay.your-domain.com"
+```
+
+Traffic through your relay is still end-to-end encrypted; the relay sees
+only ciphertext, and only your machines' keys can use your mousefinity
+peers — but note anyone who can reach an open relay can use it to carry
+their own iroh traffic, so restrict it (firewall allowlists or
+`access_control` in the relay config) if that matters to you.
 
 ## Security model
 

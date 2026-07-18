@@ -1,6 +1,7 @@
 mod capture;
 mod clipboard;
 mod config;
+mod doctor;
 mod engine;
 mod inject;
 mod ipc;
@@ -49,6 +50,9 @@ enum Cmd {
     },
     /// Interactive configuration UI (peers, layout, pairing).
     Tui,
+    /// Diagnose connectivity: what this network blocks, relay health, and
+    /// whether each peer is reachable directly or only via relay.
+    Doctor,
     /// Run the daemon (input sharing, clipboard sync, file receiving).
     Run,
     /// Send files to a peer via the running daemon.
@@ -70,18 +74,27 @@ fn main() -> Result<()> {
         };
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
+    let cli = Cli::parse();
+    // Doctor prints a human report; keep library logging out of it unless
+    // the user explicitly asks via RUST_LOG.
+    let default_filter = if matches!(cli.cmd, Cmd::Doctor) {
+        "error"
+    } else {
+        "info,iroh=warn"
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,iroh=warn".into()),
+                .unwrap_or_else(|_| default_filter.into()),
         )
         .init();
-    match Cli::parse().cmd {
+    match cli.cmd {
         Cmd::Init { name } => cmd_init(name),
         Cmd::Id => cmd_id(),
         Cmd::AddPeer { name, id } => cmd_add_peer(name, id),
         Cmd::Link { a, edge, b } => cmd_link(a, edge, b),
         Cmd::Tui => tui::run(),
+        Cmd::Doctor => doctor::run(),
         Cmd::Run => cmd_run(),
         Cmd::Send { peer, files } => ipc::client_send(&peer, &files),
     }
