@@ -120,6 +120,16 @@ mousefinity upgrade --check   # is there a newer release?
 mousefinity upgrade           # download it and replace this binary
 ```
 
+> **Upgrading from 0.3.x — update every machine.** 0.4.0 changed the wire
+> protocol (layouts are keyed by pairing id instead of host name, so two
+> machines can use different names for the same peer without inventing
+> phantom screens). Peers refuse version mismatches at the handshake, so a
+> 0.4.0 host will not talk to a 0.3.x one. 0.3.x has no `upgrade` command
+> either, so this one hop is manual: replace the binary on each machine from
+> the [releases page](https://github.com/wizix66/mousefinity/releases), then
+> restart the daemons. Your config carries over untouched, and from 0.4.0
+> onward `mousefinity upgrade` handles it.
+
 The download is checked against the `SHA256SUMS` published with the release
 (falling back to GitHub's own asset digest) before anything is installed, and
 the swap is a rename — an interrupted upgrade leaves the working binary in
