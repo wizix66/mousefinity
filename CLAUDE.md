@@ -159,5 +159,15 @@ codebase justify non-obvious decisions rather than restate code. Follow that.
 User-facing CLI output is lowercase and conversational, and errors suggest the
 next command to run.
 
-Release is tag-driven (`v*`): builds four targets plus a packaged `iroh-relay`
-server binary for self-hosting.
+Release is tag-driven (`v*`): builds five targets plus a packaged `iroh-relay`
+server binary for self-hosting, a `SHA256SUMS` that `upgrade` verifies against,
+and a CycloneDX SBOM per crate.
+
+```sh
+cargo install cargo-cyclonedx
+cargo cyclonedx --format json --spec-version 1.5 --all-features  # writes <crate>.cdx.json beside each manifest
+```
+
+Dependabot (`.github/dependabot.yml`) groups iroh patch bumps into one PR and
+ignores iroh majors — those change `PROTO_VERSION` compatibility, so both ends
+of every pair must upgrade together and a human should choose when.

@@ -1,11 +1,14 @@
 //! Input injection thread. Owns the enigo handle; other threads send commands.
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use enigo::{Axis, Coordinate, Direction, Keyboard, Mouse};
 use mousefinity_proto::{Button, Key};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
+use crate::capture::CaptureShared;
 use crate::keymap;
 
 #[derive(Debug)]
@@ -16,7 +19,7 @@ pub enum InjectCmd {
     Wheel { dx: i32, dy: i32 },
 }
 
-pub fn spawn() -> Result<mpsc::UnboundedSender<InjectCmd>> {
+pub fn spawn(shared: Arc<CaptureShared>) -> Result<mpsc::UnboundedSender<InjectCmd>> {
     let (tx, mut rx) = mpsc::unbounded_channel::<InjectCmd>();
     std::thread::Builder::new()
         .name("inject".into())
@@ -25,13 +28,27 @@ pub fn spawn() -> Result<mpsc::UnboundedSender<InjectCmd>> {
                 Ok(e) => e,
                 Err(e) => {
                     warn!("input injection unavailable: {e}");
+                    // Capture must not wait for warps that will never happen,
+                    // or remote motion would stall the first time it asks.
+                    shared.injection_unavailable();
                     return;
                 }
             };
             while let Some(cmd) = rx.blocking_recv() {
+                let warped_to = match cmd {
+                    InjectCmd::MoveAbs { x, y } => Some((x, y)),
+                    _ => None,
+                };
                 let r = apply(&mut enigo, cmd);
                 if let Err(e) = r {
                     debug!("inject failed: {e}");
+                }
+                // Only this thread knows when the pointer actually moved.
+                // Telling capture where it now is beats letting capture infer
+                // it from coordinates, which cannot reliably tell our own warp
+                // from a fast flick and turns the difference into a jump.
+                if let Some((x, y)) = warped_to {
+                    shared.note_pointer_warped_to(x, y);
                 }
             }
         })?;

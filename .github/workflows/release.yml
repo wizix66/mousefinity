@@ -74,8 +74,36 @@ jobs:
             mousefinity-relay-${{ github.ref_name }}-${{ matrix.target }}.*
           if-no-files-found: error
 
+  # A CycloneDX SBOM ships with every release so downstream users can scan
+  # what they are actually running. Generated from Cargo.lock, so it describes
+  # the exact dependency set the binaries were built from.
+  sbom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked
+      - name: Generate SBOM
+        run: |
+          cargo cyclonedx --format json --spec-version 1.5 --all-features
+          mkdir -p sbom
+          # One SBOM per crate, emitted next to each manifest.
+          cp crates/mousefinity/mousefinity.cdx.json \
+             "sbom/mousefinity-${{ github.ref_name }}.cdx.json"
+          cp crates/proto/mousefinity-proto.cdx.json \
+             "sbom/mousefinity-proto-${{ github.ref_name }}.cdx.json"
+          python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d['bomFormat'], d['specVersion'], len(d['components']), 'components')" \
+             "sbom/mousefinity-${{ github.ref_name }}.cdx.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom/*.cdx.json
+          if-no-files-found: error
+
   release:
-    needs: build
+    needs: [build, sbom]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

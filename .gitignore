@@ -8,3 +8,7 @@ probe.txt
 # come from release.yml, which also emits the SHA256SUMS `upgrade` verifies;
 # these are unsigned throwaways and must never be committed or shipped.
 /dist/
+
+# CycloneDX SBOMs are generated from Cargo.lock on demand and attached to
+# releases by release.yml; a committed copy would just go stale.
+*.cdx.json

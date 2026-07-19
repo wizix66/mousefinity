@@ -1,0 +1,34 @@
+# Dependabot is free on every GitHub repository, public or private — both the
+# security alerts and these scheduled version-update PRs. Nothing to enable
+# beyond this file, though "Dependabot security updates" is a separate toggle
+# under Settings > Code security.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    # The dependency that actually moves is iroh, and its patch releases land
+    # often. Grouping keeps one PR to review and test rather than a handful
+    # that each need the two-host check.
+    groups:
+      iroh:
+        patterns:
+          - "iroh*"
+      patch-updates:
+        update-types:
+          - patch
+    # A bump here is a wire-compatibility question, not just a version number:
+    # peers refuse mismatched PROTO_VERSION, so both ends must upgrade
+    # together. Worth a human deciding when that happens.
+    ignore:
+      - dependency-name: iroh
+        update-types:
+          - version-update:semver-major
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3

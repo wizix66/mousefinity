@@ -470,8 +470,8 @@ fn cmd_run() -> Result<()> {
         }
     }
 
-    let shared = Arc::new(capture::CaptureShared::default());
-    let inject_tx = inject::spawn()?;
+    let shared = Arc::new(capture::CaptureShared::new());
+    let inject_tx = inject::spawn(shared.clone())?;
     let (engine_tx, engine_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let engine = engine::Engine::new(
