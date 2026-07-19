@@ -105,10 +105,25 @@ fn main() -> Result<()> {
     upgrade::clean_stale();
     // These print a human report; keep library logging out of it unless the
     // user explicitly asks via RUST_LOG.
+    // Two transport crates narrate normal path-finding at a level that reads
+    // like breakage, right at startup:
+    //
+    // `noq_udp` warns on every failed sendmsg, but candidate racing
+    // deliberately tries paths that cannot work (an IPv6 address on an
+    // IPv4-only host -> WSAENETUNREACH) and MTU discovery deliberately probes
+    // above the path MTU (1326 bytes over Tailscale's 1280 -> WSAEMSGSIZE).
+    // Both recover on their own; QUIC settles on the 1200-byte baseline.
+    //
+    // `swarm_discovery` logs "no addresses for peer, not announcing" until
+    // mDNS has something to announce, which is simply how startup goes.
+    //
+    // Genuine failures still surface: `doctor` reports what the network
+    // blocks, and `RUST_LOG=info,noq_udp=warn,swarm_discovery=info` puts the
+    // running commentary back.
     let default_filter = if matches!(cli.cmd, Cmd::Doctor | Cmd::Report { .. }) {
         "error"
     } else {
-        "info,iroh=warn"
+        "info,iroh=warn,noq_udp=error,swarm_discovery=warn"
     };
     tracing_subscriber::fmt()
         .with_env_filter(
