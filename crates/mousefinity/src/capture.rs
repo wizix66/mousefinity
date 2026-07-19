@@ -51,7 +51,23 @@ pub fn run(shared: Arc<CaptureShared>, tx: UnboundedSender<EngineIn>) {
         Ok(()) => {}
         Err(e) => {
             error!("input capture unavailable: {e:?}");
-            warn!("running as a controlled-only host (no outgoing control)");
+            // This is the usual reason "it connects but my mouse will not
+            // leave this screen": the host is fine as a target and looks
+            // healthy in the logs, it just cannot originate a hop. Say what
+            // to actually do about it.
+            #[cfg(target_os = "macos")]
+            warn!(
+                "grant this binary Accessibility *and* Input Monitoring in \
+                 System Settings > Privacy & Security, then restart it — note \
+                 the permission attaches to the binary's current path, so \
+                 moving it means granting again"
+            );
+            #[cfg(target_os = "linux")]
+            warn!("add your user to the `input` group (then log out and back in)");
+            warn!(
+                "running as a controlled-only host: other machines can drive this \
+                 one, but the cursor cannot leave it"
+            );
             std::thread::park();
         }
     }

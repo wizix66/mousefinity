@@ -66,6 +66,10 @@ pub struct Engine {
     shared: Arc<CaptureShared>,
     inject: UnboundedSender<InjectCmd>,
     clip: Clip,
+    /// Edge targets we have already complained about. A blocked hop retries on
+    /// every mouse event at the edge, so the explanation has to be said once
+    /// rather than thousands of times.
+    warned_unreachable: std::collections::HashSet<String>,
 }
 
 impl Engine {
@@ -88,6 +92,7 @@ impl Engine {
             shared,
             inject,
             clip: Clip::new(),
+            warned_unreachable: std::collections::HashSet::new(),
         }
     }
 
@@ -108,6 +113,8 @@ impl Engine {
                 tx,
             } => {
                 info!("peer up: {name} ({}x{})", screen.0, screen.1);
+                // It can be complained about again if it drops later.
+                self.warned_unreachable.remove(&name);
                 // Offer our layout; whichever side has the newer revision wins.
                 let _ = tx.send(Msg::Layout {
                     rev: self.layout_rev,
@@ -223,7 +230,23 @@ impl Engine {
 
     fn hop_from_local(&mut self, edge: Edge, x: i32, y: i32, target: &str) {
         let Some(peer) = self.peers.get(target) else {
-            return; // neighbour configured but offline: stay put
+            // Staying put is right — but silence here is why "connected, yet
+            // the cursor will not cross" is so hard to diagnose. Say it once.
+            if self.warned_unreachable.insert(target.to_string()) {
+                warn!(
+                    "cursor hit the {} edge of `{}` but `{target}` is not connected, \
+                     so it stays put; connected now: {}. run `mousefinity doctor` \
+                     if `{target}` is not the name you expect",
+                    edge.name(),
+                    self.my_name,
+                    if self.peers.is_empty() {
+                        "nothing".to_string()
+                    } else {
+                        self.peers.keys().cloned().collect::<Vec<_>>().join(", ")
+                    }
+                );
+            }
+            return;
         };
         let (ex, ey) = inset(edge, entry_pos(edge, x, y, self.my_screen, peer.screen), peer.screen);
         debug!("hop {} -> {target} at ({ex},{ey})", self.my_name);

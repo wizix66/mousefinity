@@ -146,7 +146,31 @@ fn main() -> Result<()> {
     }
 }
 
+/// This machine's name, for the starter config.
+///
+/// Ask the OS before looking at the environment: Windows exports
+/// `COMPUTERNAME`, but macOS sets neither variable and zsh does not export
+/// `HOSTNAME`, so an env-only lookup silently named every mac `my-host`.
 fn host_name() -> String {
+    #[cfg(unix)]
+    {
+        let mut buf = [0u8; 256];
+        // SAFETY: gethostname writes at most buf.len() bytes into our own
+        // buffer. It may omit the trailing NUL on truncation, hence the
+        // explicit search for one below rather than assuming C-string shape.
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+        if rc == 0 {
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            if let Ok(name) = std::str::from_utf8(&buf[..end]) {
+                // Bonjour hands back "p53.local"; the bare name reads better
+                // in a layout and is what the user calls the machine.
+                let name = name.trim().trim_end_matches(".local");
+                if !name.is_empty() {
+                    return name.to_lowercase();
+                }
+            }
+        }
+    }
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .map(|s| s.to_lowercase())

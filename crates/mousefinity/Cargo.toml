@@ -48,5 +48,9 @@ sha2 = "0.10"
 # built on every platform so the zip path is testable off Windows.
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
+[target."cfg(unix)".dependencies]
+# gethostname: macOS exports neither COMPUTERNAME nor HOSTNAME.
+libc = "0.2"
+
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_UI_HiDpi"] }

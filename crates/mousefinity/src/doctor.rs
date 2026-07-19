@@ -269,6 +269,184 @@ pub async fn collect(rep: &mut Report) -> Result<()> {
     }
 
     endpoint.close().await;
+
+    // 5. Layout sanity. Connectivity and hopping are separate failures: a
+    //    perfectly connected pair still will not move the cursor if this
+    //    host's screen has no edge pointing at the other, or if the edge
+    //    names something that is not a paired peer. That combination looks
+    //    exactly like "it says connected but nothing happens", so check it
+    //    here rather than leaving it to be inferred.
+    check_layout(&cfg, rep);
+
     rep.line("done.");
     Ok(())
+}
+
+fn check_layout(cfg: &config::Config, rep: &mut Report) {
+    let mine = cfg.layout.get(&cfg.name);
+    let edges: Vec<(mousefinity_proto::Edge, &str)> = mine
+        .map(|n| {
+            [
+                mousefinity_proto::Edge::Left,
+                mousefinity_proto::Edge::Right,
+                mousefinity_proto::Edge::Up,
+                mousefinity_proto::Edge::Down,
+            ]
+            .into_iter()
+            .filter_map(|e| n.get(e).map(|t| (e, t)))
+            .collect()
+        })
+        .unwrap_or_default();
+
+    if edges.is_empty() {
+        rep.bad(
+            "layout",
+            format!(
+                "no screen is placed next to `{}`, so the cursor has nowhere to \
+                 go — run `mousefinity link {} right <peer>` (or use the tui)",
+                cfg.name, cfg.name
+            ),
+        );
+        return;
+    }
+    for (edge, target) in edges {
+        let label = format!("layout {}", edge.name());
+        if target == cfg.name {
+            rep.bad(&label, format!("points at this host itself (`{target}`)"));
+        } else if cfg.peers.contains_key(target) {
+            rep.ok(&label, format!("`{target}` — hop possible when it is up"));
+        } else {
+            // The usual cause of "connects fine, cursor will not cross".
+            rep.bad(
+                &label,
+                format!(
+                    "`{target}` is not a peer on this host, so this edge can never \
+                     fire — add it with `mousefinity add-peer {target} <id>`, or fix \
+                     the name to match one of: {}",
+                    if cfg.peers.is_empty() {
+                        "(no peers configured)".to_string()
+                    } else {
+                        cfg.peers.keys().cloned().collect::<Vec<_>>().join(", ")
+                    }
+                ),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, Peer};
+    use mousefinity_proto::Neighbors;
+
+    fn cfg_with(layout: &[(&str, Neighbors)], peers: &[&str]) -> Config {
+        Config {
+            name: "mac-mini".into(),
+            screen: None,
+            downloads: None,
+            network: Default::default(),
+            mesh_secret: None,
+            peers: peers
+                .iter()
+                .map(|n| {
+                    (
+                        n.to_string(),
+                        Peer {
+                            id: "1".repeat(64),
+                            addrs: vec![],
+                        },
+                    )
+                })
+                .collect(),
+            layout: layout.iter().map(|(n, v)| (n.to_string(), v.clone())).collect(),
+            layout_rev: 0,
+        }
+    }
+
+    fn run(cfg: &Config) -> (String, usize) {
+        let mut rep = Report::new(false);
+        check_layout(cfg, &mut rep);
+        (rep.text(), rep.failures())
+    }
+
+    #[test]
+    fn an_edge_to_a_paired_peer_passes() {
+        let cfg = cfg_with(
+            &[(
+                "mac-mini",
+                Neighbors {
+                    right: Some("p53".into()),
+                    ..Default::default()
+                },
+            )],
+            &["p53"],
+        );
+        let (text, failures) = run(&cfg);
+        assert_eq!(failures, 0, "{text}");
+        assert!(text.contains("layout right"));
+    }
+
+    /// The case that looks like "connected but the cursor will not cross".
+    #[test]
+    fn an_edge_naming_a_non_peer_fails_and_lists_the_real_names() {
+        let cfg = cfg_with(
+            &[(
+                "mac-mini",
+                Neighbors {
+                    right: Some("windows-pc".into()),
+                    ..Default::default()
+                },
+            )],
+            &["p53"],
+        );
+        let (text, failures) = run(&cfg);
+        assert_eq!(failures, 1);
+        assert!(text.contains("can never fire"));
+        assert!(text.contains("p53"), "must name what is actually paired: {text}");
+    }
+
+    #[test]
+    fn no_edge_on_this_host_is_reported_as_the_reason_nothing_hops() {
+        // Peers connect fine; there is simply nowhere to go.
+        let cfg = cfg_with(&[], &["p53"]);
+        let (text, failures) = run(&cfg);
+        assert_eq!(failures, 1);
+        assert!(text.contains("nowhere to go"), "{text}");
+    }
+
+    /// A layout that only describes *other* machines' edges is the shape you
+    /// get from a half-finished `link`, and hops from here still cannot fire.
+    #[test]
+    fn edges_belonging_only_to_other_screens_do_not_count() {
+        let cfg = cfg_with(
+            &[(
+                "p53",
+                Neighbors {
+                    left: Some("mac-mini".into()),
+                    ..Default::default()
+                },
+            )],
+            &["p53"],
+        );
+        let (_, failures) = run(&cfg);
+        assert_eq!(failures, 1);
+    }
+
+    #[test]
+    fn an_edge_pointing_at_this_host_is_flagged() {
+        let cfg = cfg_with(
+            &[(
+                "mac-mini",
+                Neighbors {
+                    right: Some("mac-mini".into()),
+                    ..Default::default()
+                },
+            )],
+            &["p53"],
+        );
+        let (text, failures) = run(&cfg);
+        assert_eq!(failures, 1);
+        assert!(text.contains("itself"), "{text}");
+    }
 }

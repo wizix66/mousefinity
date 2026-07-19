@@ -2709,6 +2709,7 @@ dependencies = [
  "flate2",
  "iroh",
  "iroh-mdns-address-lookup",
+ "libc",
  "mousefinity-proto",
  "postcard",
  "rand 0.10.2",
