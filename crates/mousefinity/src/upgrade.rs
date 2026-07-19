@@ -78,6 +78,55 @@ impl Asset {
     }
 }
 
+fn header(resp: &reqwest::Response, name: &str) -> Option<String> {
+    resp.headers()
+        .get(name)?
+        .to_str()
+        .ok()
+        .map(str::to_string)
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Explain a 403 that is really GitHub's rate limit.
+///
+/// Unauthenticated callers get 60 requests an hour **per IP address**, not per
+/// machine, so anyone sharing an office NAT can use it up without this
+/// computer having done anything. The bare "403 Forbidden" suggests the
+/// release is unreachable or the machine is blocked, when in fact waiting is
+/// all that is needed — so say which it is, and for how long.
+fn rate_limited(
+    status: u16,
+    remaining: Option<&str>,
+    reset_unix: Option<u64>,
+    now: u64,
+) -> Option<String> {
+    if status != 403 && status != 429 {
+        return None;
+    }
+    // A 403 without this header is a real refusal, not a quota.
+    if remaining? != "0" {
+        return None;
+    }
+    let wait = reset_unix
+        .map(|r| r.saturating_sub(now).div_ceil(60).max(1))
+        .map(|m| format!("about {m} minute(s)"))
+        .unwrap_or_else(|| "up to an hour".to_string());
+    Some(format!(
+        "github's api rate limit is used up for this network, so the release \
+         list cannot be read. it is counted per public IP address, so a shared \
+         office or VPN connection can exhaust it without this machine doing \
+         anything. it frees up in {wait} — nothing is wrong with the install. \
+         to update sooner, download from \
+         https://github.com/{REPO}/releases and replace the binary by hand"
+    ))
+}
+
 /// `(major, minor, patch)`, ignoring any pre-release or build suffix.
 fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
     let core = s.trim().trim_start_matches('v').split(['-', '+']).next()?;
@@ -108,12 +157,22 @@ async fn run_async(check_only: bool, assume_yes: bool) -> Result<()> {
     let current = env!("CARGO_PKG_VERSION");
     let http = client()?;
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let release: Release = http
+    let resp = http
         .get(&url)
         .header("Accept", "application/vnd.github+json")
         .send()
         .await
-        .context("cannot reach github.com — check your internet connection")?
+        .context("cannot reach github.com — check your internet connection")?;
+    if let Some(explanation) = rate_limited(
+        resp.status().as_u16(),
+        header(&resp, "x-ratelimit-remaining").as_deref(),
+        header(&resp, "x-ratelimit-reset")
+            .and_then(|v| v.parse().ok()),
+        now_unix(),
+    ) {
+        bail!("{explanation}");
+    }
+    let release: Release = resp
         .error_for_status()
         .context("github rejected the release lookup")?
         .json()
@@ -390,6 +449,31 @@ pub fn clean_stale() {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// The failure that is not a failure: waiting fixes it, and the bare 403
+    /// says nothing about that.
+    #[test]
+    fn a_spent_rate_limit_is_explained_rather_than_shown_as_forbidden() {
+        let now = 1_000_000;
+        let msg = rate_limited(403, Some("0"), Some(now + 610), now)
+            .expect("a spent quota must be recognised");
+        assert!(msg.contains("rate limit"), "{msg}");
+        assert!(msg.contains("11 minute"), "must say how long to wait: {msg}");
+        assert!(msg.contains("per public IP"), "must explain the shared-address trap");
+        // 429 is the other shape GitHub uses for this.
+        assert!(rate_limited(429, Some("0"), None, now).is_some());
+    }
+
+    #[test]
+    fn a_genuine_refusal_is_not_mistaken_for_a_rate_limit() {
+        let now = 1_000_000;
+        // Quota left, so a 403 means something else and must surface as-is.
+        assert!(rate_limited(403, Some("57"), Some(now + 60), now).is_none());
+        // No quota header at all: also a real refusal.
+        assert!(rate_limited(403, None, None, now).is_none());
+        // Success is never a rate limit.
+        assert!(rate_limited(200, Some("0"), None, now).is_none());
+    }
 
     #[test]
     fn versions_compare_numerically() {
