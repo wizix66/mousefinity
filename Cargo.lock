@@ -3803,6 +3803,7 @@ dependencies = [
 [[package]]
 name = "rdev"
 version = "0.5.3"
+source = "git+https://github.com/wizix66/rdev?branch=macos-drag-events#16fcb66629ad0bc9d9030d15ae57b0cffb140756"
 dependencies = [
  "cocoa",
  "core-foundation 0.7.0",

@@ -17,3 +17,15 @@ strip = true
 # linker (unoptimized it overflows with "export ordinal too large").
 [profile.dev.package."*"]
 opt-level = 2
+
+# rdev drops macOS drag events: a held button turns MouseMoved into
+# LeftMouseDragged, which its `convert` has no arm for, so a grab callback sees
+# no motion for the whole drag and cannot suppress it either. Click-and-drag
+# from a mac does nothing on the remote screen and leaks onto the local one.
+#
+# The branch is upstream's 0e2a1c8 — the commit rdev 0.5.3 was published from,
+# per the crate's .cargo_vcs_info.json — plus four lines. See contrib/ for the
+# patch and the measurements. Upstream's last release was 2023, so this is not
+# expected to become unnecessary.
+[patch.crates-io]
+rdev = { git = "https://github.com/wizix66/rdev", branch = "macos-drag-events" }

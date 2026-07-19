@@ -152,6 +152,22 @@ releases.
   has one `Clip`, but macOS aborts the process if several threads touch
   NSPasteboard at once, which parallel tests do.
 
+### The rdev patch
+
+`[patch.crates-io]` points rdev at a fork
+([contrib/](contrib/README.md) has the patch and the measurements). macOS sends
+`LeftMouseDragged` instead of `MouseMoved` while a button is held, and stock
+rdev converts neither, so a grab callback sees nothing for the duration of a
+drag and cannot suppress it either — click-and-drag from a mac did nothing
+remotely and leaked onto the local screen.
+
+Consequences worth knowing: the build needs to reach github.com for that git
+dependency, not just crates.io, and `cargo install mousefinity` from a registry
+would ignore the patch (`[patch]` does not survive publishing) and silently
+lose drag support. Distribution is via release binaries, so this is fine today.
+The fork branches from upstream's `0e2a1c8`, the commit 0.5.3 was published
+from; rebase onto that if it ever needs regenerating.
+
 ### Cargo profile note
 
 `[profile.dev.package."*"] opt-level = 2` is load-bearing, not just for speed:
