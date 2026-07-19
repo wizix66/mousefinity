@@ -38,7 +38,8 @@ computer. You decide how the screens are arranged.
 Grab a prebuilt binary from the
 [releases page](https://github.com/wizix66/mousefinity/releases)
 (Windows, Linux x86-64 and arm64, macOS Intel + Apple Silicon), or build from
-source:
+source. Each archive carries `THIRD-PARTY-LICENSES.md`, the notices for every
+crate compiled into that binary.
 
 ```sh
 cargo build --release          # produces target/release/mousefinity(.exe)

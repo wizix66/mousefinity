@@ -1,0 +1,47 @@
+# Configuration for `cargo about generate`, which produces the third-party
+# attribution notice shipped with every release.
+#
+# Every target is listed because the dependency set genuinely differs between
+# them — x11 and evdev only appear on Linux, windows-sys only on Windows,
+# core-graphics only on macOS. Generating for one target would ship a notice
+# that omits licences of code actually present in the other binaries.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
+
+# Build-time-only crates are not distributed, so their licences carry no
+# obligation towards someone receiving a binary.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# Anything not on this list fails the run rather than being quietly omitted:
+# silence would mean shipping a binary without a notice it requires.
+accepted = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "BSL-1.0",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Unlicense",
+    "0BSD",
+    "CDLA-Permissive-2.0",
+    "WTFPL",
+    # Weak copyleft, and the only entries here that impose a real condition.
+    # Allowed because these crates are used unmodified and merely linked:
+    # MPL-2.0 attaches per file, so the duty is to name the covered components
+    # and point at their source, not to open anything of ours. Patching one of
+    # these files would change that, so do not.
+    "MPL-2.0",
+]

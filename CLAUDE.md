@@ -198,7 +198,19 @@ CI-skip token" in commit messages; spelling it out is only safe in files.
 ```sh
 cargo install cargo-cyclonedx
 cargo cyclonedx --format json --spec-version 1.5 --all-features  # writes <crate>.cdx.json beside each manifest
+
+cargo install cargo-about --features cli
+cargo about generate about.hbs -o THIRD-PARTY-LICENSES.md
 ```
+
+The attribution notice is generated, not committed — it goes stale on every
+dependency bump. `release.yml` builds it once and copies it *into* each
+archive, since reproducing those licences is a condition of distributing the
+binary and a separate download would not discharge it. `about.toml` lists the
+licences the project will ship; anything else fails the `licenses` job in CI,
+which is what catches a Dependabot PR pulling in unacceptable terms. Three
+crates are MPL-2.0 (`attohttpc`, `epoll`, `option-ext`) — fine while they are
+only linked, so do not patch those files without revisiting it.
 
 Dependabot (`.github/dependabot.yml`) groups iroh patch bumps into one PR and
 ignores iroh majors — those change `PROTO_VERSION` compatibility, so both ends

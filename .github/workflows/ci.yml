@@ -33,6 +33,21 @@ jobs:
       - run: cargo build --release --workspace
       - run: cargo test --workspace
 
+  # `cargo about` fails on any licence not in about.toml's accepted list, so
+  # this is the gate that catches a dependency arriving under terms the
+  # project cannot ship — a Dependabot PR included. It is cheaper to reject
+  # one here than to discover it after a release has gone out.
+  licenses:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-about
+        run: cargo install cargo-about --features cli --locked
+      - name: Check third-party licences
+        run: cargo about generate about.hbs -o /dev/null
+
   # The protocol + transport layers stay pure Rust so mobile shells can embed
   # them; this job keeps that guarantee honest.
   mobile-core:

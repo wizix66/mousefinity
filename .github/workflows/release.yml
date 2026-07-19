@@ -11,7 +11,30 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The attribution notice has to travel *inside* each archive: the licences it
+  # reproduces are conditions on distributing the binary, so a separate
+  # download would not discharge them. Generated once, since about.toml covers
+  # every target, and consumed by each build job below.
+  licenses:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-about
+        run: cargo install cargo-about --features cli --locked
+      - name: Generate third-party notice
+        run: |
+          cargo about generate about.hbs -o THIRD-PARTY-LICENSES.md
+          wc -l THIRD-PARTY-LICENSES.md
+      - uses: actions/upload-artifact@v7
+        with:
+          name: third-party-licenses
+          path: THIRD-PARTY-LICENSES.md
+          if-no-files-found: error
+
   build:
+    needs: licenses
     strategy:
       fail-fast: false
       matrix:
@@ -40,6 +63,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libx11-dev libxtst-dev libxi-dev libevdev-dev libxdo-dev
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v8
+        with:
+          name: third-party-licenses
       - run: cargo build --release --target ${{ matrix.target }} -p mousefinity
       - name: Build relay server (iroh-relay)
         run: cargo install iroh-relay@1.0.2 --features server --target ${{ matrix.target }} --root relay-stage
@@ -48,11 +74,11 @@ jobs:
         run: |
           staging=mousefinity-${{ github.ref_name }}-${{ matrix.target }}
           mkdir "$staging"
-          cp target/${{ matrix.target }}/release/mousefinity README.md LICENSE-MIT LICENSE-APACHE "$staging/"
+          cp target/${{ matrix.target }}/release/mousefinity README.md LICENSE-MIT LICENSE-APACHE THIRD-PARTY-LICENSES.md "$staging/"
           tar czf "$staging.tar.gz" "$staging"
           relaystaging=mousefinity-relay-${{ github.ref_name }}-${{ matrix.target }}
           mkdir "$relaystaging"
-          cp relay-stage/bin/iroh-relay relay/relay.example.toml relay/iroh-relay.service README.md "$relaystaging/"
+          cp relay-stage/bin/iroh-relay relay/relay.example.toml relay/iroh-relay.service README.md THIRD-PARTY-LICENSES.md "$relaystaging/"
           tar czf "$relaystaging.tar.gz" "$relaystaging"
       - name: Package (windows)
         if: runner.os == 'Windows'
@@ -60,11 +86,11 @@ jobs:
         run: |
           $staging = "mousefinity-${{ github.ref_name }}-${{ matrix.target }}"
           New-Item -ItemType Directory $staging | Out-Null
-          Copy-Item target/${{ matrix.target }}/release/mousefinity.exe, README.md, LICENSE-MIT, LICENSE-APACHE $staging/
+          Copy-Item target/${{ matrix.target }}/release/mousefinity.exe, README.md, LICENSE-MIT, LICENSE-APACHE, THIRD-PARTY-LICENSES.md $staging/
           Compress-Archive -Path $staging -DestinationPath "$staging.zip"
           $relayStaging = "mousefinity-relay-${{ github.ref_name }}-${{ matrix.target }}"
           New-Item -ItemType Directory $relayStaging | Out-Null
-          Copy-Item relay-stage/bin/iroh-relay.exe, relay/relay.example.toml, README.md $relayStaging/
+          Copy-Item relay-stage/bin/iroh-relay.exe, relay/relay.example.toml, README.md, THIRD-PARTY-LICENSES.md $relayStaging/
           Compress-Archive -Path $relayStaging -DestinationPath "$relayStaging.zip"
       - uses: actions/upload-artifact@v7
         with:

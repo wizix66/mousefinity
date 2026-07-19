@@ -12,3 +12,9 @@ probe.txt
 # CycloneDX SBOMs are generated from Cargo.lock on demand and attached to
 # releases by release.yml; a committed copy would just go stale.
 *.cdx.json
+
+# The third-party attribution notice is generated from Cargo.lock by
+# `cargo about generate` and packaged into every release archive, where the
+# licences actually require it to be. A committed copy would go stale on each
+# dependency bump without anything noticing.
+THIRD-PARTY-LICENSES.md
