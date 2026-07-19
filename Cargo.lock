@@ -2679,7 +2679,7 @@ dependencies = [
 
 [[package]]
 name = "mousefinity"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2714,7 +2714,7 @@ dependencies = [
 
 [[package]]
 name = "mousefinity-proto"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "postcard",
  "serde",
