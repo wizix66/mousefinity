@@ -27,9 +27,19 @@ Upstream rdev's last release was 0.5.3 in 2023. The one published fork,
 
 ## Applying it
 
+Branch from `0e2a1c8`, the commit rdev 0.5.3 was published from. Upstream
+stopped tagging after `0.3.6`, so there is no `v0.5.3` to check out, and `main`
+is an unreleased 0.6.0 rewritten onto `objc2_core_graphics` — `[patch]` would
+reject it as semver-incompatible with the `0.5.3` this workspace asks for, and
+it is a different implementation besides.
+
+The commit is not guesswork: the published `.crate` records it in
+`.cargo_vcs_info.json`, and its `src/macos/common.rs` is byte-identical to the
+crate cargo actually builds.
+
 ```sh
 git clone https://github.com/Narsil/rdev && cd rdev
-git checkout -b macos-drag-events v0.5.3
+git checkout -b macos-drag-events 0e2a1c8bb0c2b58f31ed3105c3a800695f7497f9
 git apply /path/to/rdev-macos-drag-events.patch
 git commit -am "macOS: report motion while a mouse button is held"
 git push <your-fork> macos-drag-events
