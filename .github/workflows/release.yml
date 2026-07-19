@@ -66,7 +66,7 @@ jobs:
           New-Item -ItemType Directory $relayStaging | Out-Null
           Copy-Item relay-stage/bin/iroh-relay.exe, relay/relay.example.toml, README.md $relayStaging/
           Compress-Archive -Path $relayStaging -DestinationPath "$relayStaging.zip"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: mousefinity-${{ matrix.target }}
           path: |
@@ -96,7 +96,7 @@ jobs:
              "sbom/mousefinity-proto-${{ github.ref_name }}.cdx.json"
           python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d['bomFormat'], d['specVersion'], len(d['components']), 'components')" \
              "sbom/mousefinity-${{ github.ref_name }}.cdx.json"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sbom
           path: sbom/*.cdx.json
