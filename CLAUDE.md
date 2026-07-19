@@ -169,10 +169,15 @@ Release is tag-driven (`v*`): builds five targets plus a packaged `iroh-relay`
 server binary for self-hosting, a `SHA256SUMS` that `upgrade` verifies against,
 and a CycloneDX SBOM per crate.
 
-**Never put `[skip ci]` in a commit you intend to tag.** It suppresses every
-workflow triggered by a push referencing that commit, and a tag push is a push
-— so the release silently does not build. There is no failed run to notice,
-just a tag with no release behind it. Cost of finding out: one deleted tag.
+**Never put the CI-skip token in a commit you intend to tag.** It suppresses
+every workflow triggered by a push referencing that commit, and a tag push is
+a push — so the release silently does not build. There is no failed run to
+notice, just a tag with no release behind it.
+
+The token is matched as a literal substring anywhere in the message, including
+in prose *about* it — a commit explaining this trap, with the token quoted in
+its own message, suppressed the release a second time. Write it as "the
+CI-skip token" in commit messages; spelling it out is only safe in files.
 
 ```sh
 cargo install cargo-cyclonedx
