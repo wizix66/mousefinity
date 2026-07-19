@@ -1,0 +1,26 @@
+a/src/macos/common.rs	2006-07-23 21:21:28
+b/src/macos/common.rs	2026-07-19 16:37:27
+@@ -49,6 +49,7 @@
+     + (1 << CGEventType::MouseMoved as u64)
+     + (1 << CGEventType::LeftMouseDragged as u64)
+     + (1 << CGEventType::RightMouseDragged as u64)
++    + (1 << CGEventType::OtherMouseDragged as u64)
+     + (1 << CGEventType::KeyDown as u64)
+     + (1 << CGEventType::KeyUp as u64)
+     + (1 << CGEventType::FlagsChanged as u64)
+@@ -96,7 +97,14 @@
+         CGEventType::LeftMouseUp => Some(EventType::ButtonRelease(Button::Left)),
+         CGEventType::RightMouseDown => Some(EventType::ButtonPress(Button::Right)),
+         CGEventType::RightMouseUp => Some(EventType::ButtonRelease(Button::Right)),
+-        CGEventType::MouseMoved => {
++        // A held button turns MouseMoved into a Dragged event, so without
++        // these arms a grab callback sees no motion at all for the whole
++        // duration of a drag — and, because `grab` only consults the callback
++        // for events that convert, cannot suppress that motion either.
++        CGEventType::MouseMoved
++        | CGEventType::LeftMouseDragged
++        | CGEventType::RightMouseDragged
++        | CGEventType::OtherMouseDragged => {
+             let point = cg_event.location();
+             Some(EventType::MouseMove {
+                 x: point.x,
