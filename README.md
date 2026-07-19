@@ -342,14 +342,18 @@ Playbook, from easiest to most locked-down:
 
    If two machines on the same subnet still end up relayed (or detouring
    through a VPN), run `mousefinity doctor` on **both** and compare the
-   `local addresses` line. Hole-punching opens host firewalls the same way it
-   opens NAT — both sides send outbound, and the stateful pinhole that
-   creates lets the reply back in, so no inbound rule is needed. What it
-   cannot do is guess an address nobody advertised: Windows classifies
-   unknown Wi-Fi as *Public*, which blocks inbound mDNS, so a peer may never
-   learn the LAN address and never send there. Either mark the network
-   Private, or pin the route explicitly on both hosts, which needs no
-   firewall change at all:
+   `local addresses` line.
+
+   Hole-punching opens host firewalls the same way it opens NAT, and needs
+   no inbound rule and no admin rights: each side sending outbound creates
+   the stateful pinhole that lets the other's packets back in. What it
+   cannot do is guess an address nobody told it about. On a locked-down
+   machine the usual culprit is discovery, not the punch — Windows
+   classifies unknown Wi-Fi as *Public* and blocks inbound mDNS, so the LAN
+   address may never arrive and nothing ever probes it.
+
+   Pinning the route fixes that with a config file edit alone. Set it on
+   **both** hosts, so both send outbound and both pinholes open:
 
    ```toml
    [network]
@@ -359,6 +363,11 @@ Playbook, from easiest to most locked-down:
    id = "…"
    addrs = ["10.10.10.42:48800"]
    ```
+
+   This is also the diagnostic: if pinning makes the LAN path appear, the
+   addresses were not reaching each other. If it does not, the packets
+   themselves are being dropped and no amount of configuration will help —
+   the relay is the fallback, and it only costs latency.
 2. **Across the internet, normal NAT (home router)** — nothing to do.
    Hole-punching establishes a direct path in the common case; otherwise
    traffic rides the relay (encrypted end to end — relays only ever see

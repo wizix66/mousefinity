@@ -10,3 +10,10 @@ serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
 tokio = { version = "1", features = ["io-util"] }
 thiserror = "2"
+
+[dev-dependencies]
+# The frame round-trip test drives an async fn, so it needs a runtime. Only a
+# dev-dependency: the crate itself stays runtime-free, which is what lets it
+# build for mobile targets. Without this, testing the crate on its own fails —
+# it only ever compiled because the workspace build unified in `rt`.
+tokio = { version = "1", features = ["rt"] }

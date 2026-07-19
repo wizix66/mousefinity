@@ -422,6 +422,73 @@ mod tests {
         assert_eq!(crossing(5, 5, (1920, 1080)), None);
     }
 
+    /// Entry is proportional along the shared edge, so the cursor comes out
+    /// where it went in regardless of how differently the screens are shaped.
+    #[test]
+    fn landscape_to_portrait_keeps_the_relative_position() {
+        // Leaving a 1920x1080 screen 25% down its right edge...
+        let (x, y) = entry_pos(Edge::Right, 1920, 270, (1920, 1080), (1080, 1920));
+        // ...arrives 25% down a portrait 1080x1920 screen.
+        assert_eq!(x, 0);
+        assert_eq!(y, 480);
+    }
+
+    #[test]
+    fn portrait_to_landscape_keeps_the_relative_position() {
+        let (x, y) = entry_pos(Edge::Left, 0, 1440, (1080, 1920), (1920, 1080));
+        assert_eq!(x, 1919, "enters at the far edge of the destination");
+        assert_eq!(y, 810, "75% down the portrait screen is 75% down the wide one");
+    }
+
+    /// A 5K screen next to a small laptop is the worst case for a naive
+    /// mapping: without scaling, the bottom half of the tall screen would be
+    /// unreachable from the short one.
+    #[test]
+    fn extreme_resolution_differences_still_span_the_whole_edge() {
+        let small = (1280u32, 800u32);
+        let huge = (5120u32, 2880u32);
+        let top = entry_pos(Edge::Right, 1280, 0, small, huge);
+        let bottom = entry_pos(Edge::Right, 1280, 799, small, huge);
+        assert_eq!(top.1, 0);
+        assert!(
+            bottom.1 >= 2875,
+            "the bottom of the small screen must reach the bottom of the big one, got {}",
+            bottom.1
+        );
+    }
+
+    /// Vertical edges scale along x, and the entry point is always inside the
+    /// destination so arriving cannot immediately re-trigger a crossing.
+    #[test]
+    fn stacked_screens_scale_along_the_other_axis() {
+        let (x, y) = entry_pos(Edge::Down, 960, 1080, (1920, 1080), (3840, 2160));
+        assert_eq!(x, 1920);
+        assert_eq!(y, 0);
+        let (x, y) = entry_pos(Edge::Up, 960, 0, (1920, 1080), (3840, 2160));
+        assert_eq!(x, 1920);
+        assert_eq!(y, 2159);
+    }
+
+    /// Every entry point must land inside the destination, whatever the
+    /// shapes involved — an out-of-bounds entry would hop straight back.
+    #[test]
+    fn entry_is_always_within_the_destination() {
+        let shapes = [(1920u32, 1080u32), (1080, 1920), (1280, 800), (5120, 2880)];
+        for from in shapes {
+            for to in shapes {
+                for edge in [Edge::Left, Edge::Right, Edge::Up, Edge::Down] {
+                    for (x, y) in [(0, 0), (from.0 as i32 - 1, from.1 as i32 - 1)] {
+                        let (ex, ey) = entry_pos(edge, x, y, from, to);
+                        assert!(
+                            ex >= 0 && ex < to.0 as i32 && ey >= 0 && ey < to.1 as i32,
+                            "{edge:?} from {from:?} at ({x},{y}) into {to:?} gave ({ex},{ey})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn entry_scaling() {
         // Crossing right edge of a 1920x1080 screen into a 3840x2160 screen
