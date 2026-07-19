@@ -99,9 +99,14 @@ releases.
   cursor across every screen and streams absolute positions; controlled peers
   never make hop decisions. Breaking this reintroduces feedback loops from
   injected events.
-- **While remote, the physical cursor parks at screen centre** and every hook
-  event is turned into a delta. `warp_pending` exists so our own warp isn't
-  read back as user motion.
+- **While remote, motion is the difference between consecutive hook events**,
+  never the offset from screen centre — suppressing an event does not pin the
+  pointer, so a fixed reference re-reports accumulated drift and the remote
+  cursor accelerates away (`remote_motion` in
+  [capture.rs](crates/mousefinity/src/capture.rs) has the regression test).
+  The pointer is warped back to centre only when it drifts far enough to risk
+  reaching a physical edge, and `warp_pending` keeps that warp from being read
+  back as user motion.
 - **Trust is per-machine and never gossiped by manual pairing.** A peer *is*
   its iroh `EndpointId`; anything not in `peers` is refused at accept. Only
   hosts sharing a mesh token accept `Roster` gossip.

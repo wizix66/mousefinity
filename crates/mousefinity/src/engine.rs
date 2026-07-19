@@ -26,6 +26,9 @@ pub enum LocalEvent {
     Button { button: Button, down: bool },
     Key { key: Key, down: bool },
     Wheel { dx: i32, dy: i32 },
+    /// The parked pointer has drifted towards a physical edge; put it back at
+    /// the centre before it gets stuck there and stops reporting motion.
+    Recenter,
     /// ScrollLock pressed: force control back to this host.
     EmergencyRelease,
 }
@@ -219,6 +222,16 @@ impl Engine {
             }
             LocalEvent::Wheel { dx, dy } => {
                 self.send_focused(Msg::Wheel { dx, dy });
+            }
+            LocalEvent::Recenter => {
+                // Only meaningful while parked; capture sets warp_pending so
+                // the resulting event is recognised as ours and not as motion.
+                if !matches!(self.focus, Focus::Local) {
+                    let _ = self.inject.send(InjectCmd::MoveAbs {
+                        x: self.my_screen.0 as i32 / 2,
+                        y: self.my_screen.1 as i32 / 2,
+                    });
+                }
             }
             LocalEvent::EmergencyRelease => {
                 if !matches!(self.focus, Focus::Local) {

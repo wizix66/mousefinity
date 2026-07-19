@@ -170,6 +170,29 @@ pub async fn collect(rep: &mut Report) -> Result<()> {
         }
     }
 
+    // 2b. What this host offers peers to dial. A LAN path can only form if the
+    //     other side learns a LAN address from here, so when same-subnet hosts
+    //     end up relayed (or on a VPN detour) this is the first thing to look
+    //     at: either the address is missing, or it is present and the far end
+    //     cannot reach it.
+    let local: Vec<String> = endpoint
+        .addr()
+        .addrs
+        .iter()
+        .filter_map(|a| match a {
+            iroh::TransportAddr::Ip(s) => Some(s.to_string()),
+            _ => None,
+        })
+        .collect();
+    if local.is_empty() {
+        rep.note(
+            "local addresses",
+            "none advertised yet — peers can only reach this host via the relay",
+        );
+    } else {
+        rep.ok("local addresses", local.join(", "));
+    }
+
     // 3. Home relay connection state (shows TLS errors explicitly).
     let mut relay_watch = endpoint.home_relay_status();
     let statuses = relay_watch.get();

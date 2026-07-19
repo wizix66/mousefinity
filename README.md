@@ -339,6 +339,26 @@ Playbook, from easiest to most locked-down:
 
 1. **Home / office LAN** — nothing to do. mDNS finds peers; direct QUIC on
    the LAN carries everything.
+
+   If two machines on the same subnet still end up relayed (or detouring
+   through a VPN), run `mousefinity doctor` on **both** and compare the
+   `local addresses` line. Hole-punching opens host firewalls the same way it
+   opens NAT — both sides send outbound, and the stateful pinhole that
+   creates lets the reply back in, so no inbound rule is needed. What it
+   cannot do is guess an address nobody advertised: Windows classifies
+   unknown Wi-Fi as *Public*, which blocks inbound mDNS, so a peer may never
+   learn the LAN address and never send there. Either mark the network
+   Private, or pin the route explicitly on both hosts, which needs no
+   firewall change at all:
+
+   ```toml
+   [network]
+   port = 48800            # fixed, so the other side has something to aim at
+
+   [peers.p53]
+   id = "…"
+   addrs = ["10.10.10.42:48800"]
+   ```
 2. **Across the internet, normal NAT (home router)** — nothing to do.
    Hole-punching establishes a direct path in the common case; otherwise
    traffic rides the relay (encrypted end to end — relays only ever see
