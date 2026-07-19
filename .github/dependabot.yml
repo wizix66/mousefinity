@@ -32,3 +32,9 @@ updates:
     schedule:
       interval: monthly
     open-pull-requests-limit: 3
+    ignore:
+      # Pinned to a branch, not a tag — `@stable` is how this action is meant
+      # to be used, since it resolves to whatever the current stable toolchain
+      # is. There is no version for Dependabot to compare, and the run errors
+      # out rather than skipping it.
+      - dependency-name: dtolnay/rust-toolchain
