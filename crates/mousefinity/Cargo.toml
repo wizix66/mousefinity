@@ -43,7 +43,7 @@ reqwest = { version = "0.13", default-features = false, features = [
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 flate2 = "1"
 tar = "0.4"
-sha2 = "0.10"
+sha2 = "0.11"
 # Windows releases ship as .zip, everything else as .tar.gz. Both readers are
 # built on every platform so the zip path is testable off Windows.
 zip = { version = "2", default-features = false, features = ["deflate"] }
