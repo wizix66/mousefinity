@@ -381,9 +381,11 @@ impl Net {
             while let Some(msg) = rx.recv().await {
                 // The engine speaks local names; the wire speaks ids.
                 let msg = match msg {
-                    Msg::Layout { rev, layout } => Msg::Layout {
-                        rev,
-                        layout: self.layout_to_wire(&layout),
+                    Msg::Layout { rev, layout } => match self.layout_to_wire(&layout) {
+                        Some(layout) => Msg::Layout { rev, layout },
+                        // Untranslatable: dropping the message is safer than
+                        // gossiping an empty layout at a winning revision.
+                        None => continue,
                     },
                     other => other,
                 };
@@ -449,10 +451,16 @@ impl Net {
     /// Ids already in the layout (machines this host never named) pass through
     /// untouched, so gossiping through a host that has not paired with every
     /// machine does not shrink the layout.
-    fn layout_to_wire(&self, layout: &Layout) -> Layout {
+    ///
+    /// Returns `None` when a non-empty layout translates to nothing. Every
+    /// name being unresolvable means this host's own config is wrong, and
+    /// `rev` is newer than whatever the peer holds — so sending the empty
+    /// result would overwrite a perfectly good arrangement on every other
+    /// machine with our local mistake. Staying quiet keeps the damage here.
+    fn layout_to_wire(&self, layout: &Layout) -> Option<Layout> {
         let my_id = self.endpoint.id().to_string();
         let by_name = self.peers_by_name.read().unwrap();
-        map_layout(layout, |r: &str| {
+        let wire = map_layout(layout, |r: &str| {
             if r == self.my_name {
                 return Some(my_id.clone());
             }
@@ -460,7 +468,28 @@ impl Net {
                 return Some(id.to_string());
             }
             r.parse::<EndpointId>().ok().map(|_| r.to_string())
-        })
+        });
+        if layout.0.is_empty() {
+            return Some(wire);
+        }
+        if wire.0.is_empty() {
+            warn!(
+                "not sharing the screen layout: none of {:?} is a paired peer on this \
+                 host, so there is nothing meaningful to send. run `mousefinity doctor` \
+                 — those edges cannot hop from here either",
+                layout.0.keys().collect::<Vec<_>>()
+            );
+            return None;
+        }
+        if wire.0.len() < layout.0.len() {
+            warn!(
+                "sharing a partial layout: {} of {} screens reference machines this host \
+                 has not paired with and were left out",
+                layout.0.len() - wire.0.len(),
+                layout.0.len()
+            );
+        }
+        Some(wire)
     }
 
     /// Endpoint ids -> local names, for a layout that just arrived.
@@ -806,6 +835,18 @@ mod tests {
             |r: &str| (r != "ghost").then(|| r.to_string()),
         );
         assert_eq!(out, layout(&[]), "an emptied screen is pruned too");
+    }
+
+    /// A layout naming only unpaired machines must not travel: it arrives at
+    /// a winning revision and would wipe a working arrangement everywhere.
+    #[test]
+    fn a_layout_that_resolves_to_nothing_is_not_sent() {
+        let local = layout(&[("a", None, Some("ghost"))]);
+        let wire = map_layout(&local, |r: &str| (r != "ghost" && r != "a").then(|| r.to_string()));
+        assert!(
+            wire.0.is_empty() && !local.0.is_empty(),
+            "this is the shape layout_to_wire refuses to send"
+        );
     }
 
     #[test]

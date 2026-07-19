@@ -153,6 +153,22 @@ impl Engine {
         if rev <= self.layout_rev {
             return;
         }
+        // A newer revision that says "there is no arrangement" is far more
+        // likely to be a misconfigured or half-translated peer than a genuine
+        // intent to unlink every screen, and adopting it silently deletes a
+        // working setup on every machine it reaches. Clearing the layout
+        // locally still works; it just does not travel.
+        if layout.0.is_empty() && !self.layout.0.is_empty() {
+            if let Some(from) = source {
+                warn!(
+                    "ignoring empty layout rev {rev} from `{from}` — keeping the {} screen(s) \
+                     configured here. `{from}` probably references machines it has not paired \
+                     with; run `mousefinity doctor` there",
+                    self.layout.0.len()
+                );
+                return;
+            }
+        }
         info!("adopting layout rev {rev} from {}", source.unwrap_or("disk"));
         self.layout_rev = rev;
         self.layout = layout.clone();
@@ -483,6 +499,53 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "timed out waiting");
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+
+    /// A peer whose own config is broken translates its layout to nothing and
+    /// gossips that at a winning revision. Adopting it would silently unlink
+    /// every screen here, which looks exactly like "it connects but the cursor
+    /// will not cross".
+    #[test]
+    fn an_empty_layout_from_a_peer_does_not_wipe_a_working_one() {
+        let mut r = rig();
+        r.tx.send(EngineIn::PeerMsg {
+            name: "b".into(),
+            msg: Msg::Layout {
+                rev: u64::MAX,
+                layout: Layout(std::collections::BTreeMap::new()),
+            },
+        })
+        .unwrap();
+        // The edge still hops, so the arrangement survived.
+        r.tx.send(EngineIn::Local(LocalEvent::Move { x: 999, y: 500 }))
+            .unwrap();
+        match recv(&mut r.peer_rx) {
+            Msg::Enter { .. } => {}
+            other => panic!("layout was wiped by the empty gossip: got {other:?}"),
+        }
+    }
+
+    /// Clearing the layout locally is a real intent and must still apply.
+    #[test]
+    fn an_empty_layout_from_disk_is_applied() {
+        let mut r = rig();
+        r.tx.send(EngineIn::SetLayout {
+            rev: u64::MAX,
+            layout: Layout(std::collections::BTreeMap::new()),
+        })
+        .unwrap();
+        // A local edit is authoritative, so it is adopted and gossiped on.
+        match recv(&mut r.peer_rx) {
+            Msg::Layout { layout, .. } => assert!(layout.0.is_empty()),
+            other => panic!("expected the cleared layout to gossip, got {other:?}"),
+        }
+        r.tx.send(EngineIn::Local(LocalEvent::Move { x: 999, y: 500 }))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(
+            r.peer_rx.try_recv().is_err(),
+            "a local edit clearing the layout should stop hops"
+        );
     }
 
     #[test]
