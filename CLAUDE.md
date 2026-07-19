@@ -102,11 +102,17 @@ releases.
 - **While remote, motion is the difference between consecutive hook events**,
   never the offset from screen centre — suppressing an event does not pin the
   pointer, so a fixed reference re-reports accumulated drift and the remote
-  cursor accelerates away (`remote_motion` in
-  [capture.rs](crates/mousefinity/src/capture.rs) has the regression test).
-  The pointer is warped back to centre only when it drifts far enough to risk
-  reaching a physical edge, and `warp_pending` keeps that warp from being read
-  back as user motion.
+  cursor accelerates away.
+- **Which event was our own warp is not decided from coordinates.** A warp
+  landing slightly off is indistinguishable from a fast flick; two attempts at
+  telling them apart both leaked the teleport distance to the far screen as a
+  jump. Instead any step above `MAX_STEP` is discarded, and `RECENTRE_AT` is
+  kept a smaller divisor so a warp is always longer than the largest allowed
+  step — `a_warp_is_always_longer_than_the_largest_allowed_step` in
+  [capture.rs](crates/mousefinity/src/capture.rs) pins that relationship.
+  Preserve it if you touch either constant. The inject thread reports where it
+  put the pointer, which keeps discards near zero, but correctness does not
+  depend on that arriving.
 - **Trust is per-machine and never gossiped by manual pairing.** A peer *is*
   its iroh `EndpointId`; anything not in `peers` is refused at accept. Only
   hosts sharing a mesh token accept `Roster` gossip.
