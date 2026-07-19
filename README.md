@@ -84,6 +84,11 @@ Manually paired machines are not mesh members: they never accept roster
 gossip, so nothing gets added to their trust list behind their back.
 </details>
 
+Made a mess of it? `mousefinity init --force` clears the peers, layout and
+mesh token and starts from a blank config. It asks first, showing exactly
+what it is about to drop, and it **keeps this host's pairing id** — so other
+machines carry on trusting this one, though this one forgets them.
+
 Arrange the screens **on any machine** (the layout syncs to every
 connected peer automatically — newest edit wins):
 

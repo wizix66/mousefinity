@@ -38,6 +38,10 @@ enum Cmd {
         /// Host name used in the layout (defaults to the computer name).
         #[arg(long)]
         name: Option<String>,
+        /// Start over: discard the peers, layout and mesh token in the
+        /// existing config. Asks first. Keeps this host's pairing id.
+        #[arg(long)]
+        force: bool,
     },
     /// Print this host's pairing id.
     Id,
@@ -132,7 +136,7 @@ fn main() -> Result<()> {
         )
         .init();
     match cli.cmd {
-        Cmd::Init { name } => cmd_init(name),
+        Cmd::Init { name, force } => cmd_init(name, force),
         Cmd::Id => cmd_id(),
         Cmd::AddPeer { name, id } => cmd_add_peer(name, id),
         Cmd::Link { a, edge, b } => cmd_link(a, edge, b),
@@ -182,10 +186,16 @@ fn identity() -> Result<iroh::SecretKey> {
     Ok(iroh::SecretKey::from_bytes(&secret))
 }
 
-fn cmd_init(name: Option<String>) -> Result<()> {
+fn cmd_init(name: Option<String>, force: bool) -> Result<()> {
     let key = identity()?;
-    if config::config_path()?.exists() {
+    let exists = config::config_path()?.exists();
+    if exists && force && !confirm_reset(name.as_deref())? {
+        println!("left the config alone.");
+        return Ok(());
+    }
+    if exists && !force {
         println!("config already exists at {}", config::config_path()?.display());
+        println!("(`mousefinity init --force` starts over, keeping this pairing id)");
     } else {
         let cfg = config::Config {
             name: name.unwrap_or_else(host_name),
@@ -200,6 +210,12 @@ fn cmd_init(name: Option<String>) -> Result<()> {
         config::save(&cfg)?;
         println!("wrote {}", config::config_path()?.display());
         println!("host name: {}", cfg.name);
+        if exists && ipc::daemon_reachable() {
+            println!(
+                "a daemon is running with the old config — restart it, since a reset \
+                 drops the peers it is currently connected to"
+            );
+        }
     }
     println!("pairing id: {}", key.public());
     println!();
@@ -209,6 +225,63 @@ fn cmd_init(name: Option<String>) -> Result<()> {
     println!("  3. arrange screens: `mousefinity link <this-host> right <name>`");
     println!("  4. start `mousefinity run` everywhere");
     Ok(())
+}
+
+/// Spell out what `init --force` is about to discard.
+///
+/// The pairing id is the one thing it keeps, and that asymmetry is worth
+/// stating: peers identify this host by that key so they keep trusting it,
+/// but this host forgets every one of them.
+fn confirm_reset(new_name: Option<&str>) -> Result<bool> {
+    println!("this will rewrite {}", config::config_path()?.display());
+    match config::load() {
+        Ok(cfg) => {
+            let rename = match new_name {
+                Some(n) if n != cfg.name => format!(" -> `{n}`"),
+                _ => String::new(),
+            };
+            println!("  host name: `{}`{rename}", cfg.name);
+            if cfg.peers.is_empty() {
+                println!("  peers: none configured");
+            } else {
+                println!(
+                    "  peers dropped ({}): {}",
+                    cfg.peers.len(),
+                    cfg.peers.keys().cloned().collect::<Vec<_>>().join(", ")
+                );
+            }
+            if cfg.layout.is_empty() {
+                println!("  screen layout: none configured");
+            } else {
+                println!("  screen layout: {} screen(s), all edges cleared", cfg.layout.len());
+            }
+            if cfg.mesh_secret.is_some() {
+                println!("  mesh token dropped: this host leaves the mesh and needs a new ticket to rejoin");
+            }
+        }
+        // Being unreadable is a fine reason to want a reset, so offer it anyway.
+        Err(e) => println!("  (the current config could not be read: {e:#})"),
+    }
+    println!();
+    println!("your pairing id is kept, so other machines still trust this one —");
+    println!("but this host forgets them, and you will need to add them again.");
+    confirm("start over?")
+}
+
+/// Ask a yes/no question. Anything but an explicit yes is no, and a
+/// non-interactive stdin reads as EOF, which is also no.
+pub(crate) fn confirm(question: &str) -> Result<bool> {
+    use std::io::Write as _;
+    print!("{question} [y/N] ");
+    std::io::stdout().flush().ok();
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .context("cannot read from stdin")?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 fn cmd_id() -> Result<()> {

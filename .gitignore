@@ -3,3 +3,8 @@ daemon.err
 daemon.out
 probe.txt
 .claude/
+
+# Locally built binaries for testing before a release. The published ones
+# come from release.yml, which also emits the SHA256SUMS `upgrade` verifies;
+# these are unsigned throwaways and must never be committed or shipped.
+/dist/

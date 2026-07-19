@@ -8,7 +8,7 @@
 //! bytes hash to what was published" is worth the few lines. A release
 //! offering neither is refused rather than trusted.
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -164,7 +164,7 @@ async fn run_async(check_only: bool, assume_yes: bool) -> Result<()> {
         );
     }
 
-    if !assume_yes && !confirm(&format!("install {} over this binary?", asset.name))? {
+    if !assume_yes && !crate::confirm(&format!("install {} over this binary?", asset.name))? {
         println!("cancelled.");
         return Ok(());
     }
@@ -376,19 +376,6 @@ fn swap_in(staged: &std::path::Path, target: &std::path::Path, old: &std::path::
     Ok(())
 }
 
-fn confirm(question: &str) -> Result<bool> {
-    print!("{question} [y/N] ");
-    std::io::stdout().flush().ok();
-    let mut answer = String::new();
-    std::io::stdin()
-        .read_line(&mut answer)
-        .context("cannot read from stdin")?;
-    Ok(matches!(
-        answer.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
-}
-
 /// Sweep the previous binary if an upgrade could not delete it in place —
 /// which on Windows is every upgrade, since the running image stays locked.
 pub fn clean_stale() {
@@ -402,6 +389,7 @@ pub fn clean_stale() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn versions_compare_numerically() {
