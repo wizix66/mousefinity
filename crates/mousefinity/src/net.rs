@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use iroh::endpoint::presets;
+use iroh::endpoint::{presets, IdleTimeout};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use mousefinity_proto::{
     read_frame, write_frame, Edge, FileOffer, JoinRequest, JoinResponse, Layout, Member, Msg,
@@ -133,6 +133,21 @@ pub async fn bind_endpoint(
             builder = builder.relay_mode(iroh::RelayMode::Custom(iroh::RelayMap::from(url)));
         }
     }
+    // Notice a dead peer quickly. iroh defaults to a 5s heartbeat and a 15s
+    // path idle timeout, which is sensible for bulk transfer but not for
+    // input: if the focused host disappears, every keystroke keeps going to a
+    // machine that is gone until the connection finally times out, and the
+    // keyboard appears stuck. Halving the heartbeat and cutting the idle
+    // timeout to 6s means `PeerDown` fires — and control returns home —
+    // within a few seconds. ScrollLock remains the instant escape hatch.
+    let transport = iroh::endpoint::QuicTransportConfig::builder()
+        .keep_alive_interval(Duration::from_secs(2))
+        .max_idle_timeout(Some(
+            IdleTimeout::try_from(Duration::from_secs(6)).expect("6s is a valid idle timeout"),
+        ))
+        .build();
+    builder = builder.transport_config(transport);
+
     // Trust the OS certificate store in addition to the built-in webpki
     // roots, so relay connections survive corporate TLS-inspection
     // proxies whose root CA is installed on this machine. (The full

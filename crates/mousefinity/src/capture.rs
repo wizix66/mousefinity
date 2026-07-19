@@ -8,8 +8,10 @@
 //! from the screen centre. Suppressing an event does not reliably pin the
 //! pointer, so it drifts; measuring from a fixed centre would then re-report
 //! the accumulated offset on every event and send the remote cursor flying.
-//! The centre is still where the pointer gets warped back to, but only once it
-//! has drifted far enough to risk reaching a physical edge and going silent.
+//! The pointer is warped back to the centre once it strays past a quarter of
+//! the way to an edge — both so it cannot reach one and go silent, and because
+//! it stays visible while parked, and a pointer wandering off by itself looks
+//! broken even when the remote cursor is behaving.
 
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
@@ -54,6 +56,12 @@ impl CaptureShared {
     }
 }
 
+/// A warp is treated as landed if it arrives within this many pixels of the
+/// centre. Exact equality is too strict: the pointer can settle a pixel off
+/// under display scaling, and a missed match means the entire teleport
+/// distance is forwarded as real movement — a visible jump on the far screen.
+const WARP_TOLERANCE: i32 = 8;
+
 /// What one hook event means while the cursor is on a remote screen.
 #[derive(Debug, PartialEq, Eq)]
 struct Motion {
@@ -62,26 +70,57 @@ struct Motion {
     /// The pointer has drifted far enough that it risks reaching a physical
     /// screen edge, where it would stop reporting motion altogether.
     recenter: bool,
+    /// This event was our own warp arriving. Adopt the position as the new
+    /// reference and forward nothing.
+    absorbed: bool,
 }
 
 /// Movement is measured against the *previous* event, not against the centre.
 ///
 /// Measuring from the centre is only correct if the pointer is warped back
-/// after every single event. It is not — it is warped once, on the hop — so
-/// the offset from centre keeps growing and each event re-reports the entire
-/// accumulated distance. Travel then grows quadratically, which reads as a
-/// cursor that shoots across the remote screen. Differencing against the last
-/// position gives the true per-event movement whether or not the pointer
-/// happens to be pinned.
-fn remote_motion(pos: (i32, i32), last: (i32, i32), centre: (i32, i32)) -> Motion {
-    // Recentre well before a physical edge can swallow the motion. Halfway
-    // out from the centre leaves plenty of room for the warp to land.
-    let margin_x = (centre.0 / 2).max(1);
-    let margin_y = (centre.1 / 2).max(1);
+/// after every single event. It is not, so the offset from centre keeps
+/// growing and each event re-reports the entire accumulated distance; travel
+/// then grows quadratically. Differencing against the last position gives the
+/// true per-event movement whether or not the pointer happens to be pinned.
+///
+/// `warp_pending` says we asked for a warp and are waiting for it to land.
+/// Only then is an event allowed to be discarded, so ordinary motion can never
+/// be swallowed by mistake.
+fn remote_motion(
+    pos: (i32, i32),
+    last: (i32, i32),
+    centre: (i32, i32),
+    warp_pending: bool,
+) -> Motion {
+    let dx = pos.0 - last.0;
+    let dy = pos.1 - last.1;
+    // Keep the pointer near the middle of the screen: it is visible the whole
+    // time it is parked, and a pointer wandering off on its own looks broken
+    // even when the remote cursor is behaving.
+    let margin_x = (centre.0 / 4).max(1);
+    let margin_y = (centre.1 / 4).max(1);
+    let strayed = (pos.0 - centre.0).abs() > margin_x || (pos.1 - centre.1).abs() > margin_y;
+
+    if warp_pending {
+        let at_centre = (pos.0 - centre.0).abs() <= WARP_TOLERANCE
+            && (pos.1 - centre.1).abs() <= WARP_TOLERANCE;
+        // Either the warp landed where it was aimed, or it landed coalesced
+        // with motion — a single event no hand could have produced. Both mean
+        // the apparent movement is teleport distance, not travel.
+        if at_centre || dx.abs() > margin_x || dy.abs() > margin_y {
+            return Motion {
+                dx: 0,
+                dy: 0,
+                recenter: false,
+                absorbed: true,
+            };
+        }
+    }
     Motion {
-        dx: pos.0 - last.0,
-        dy: pos.1 - last.1,
-        recenter: (pos.0 - centre.0).abs() > margin_x || (pos.1 - centre.1).abs() > margin_y,
+        dx,
+        dy,
+        recenter: strayed,
+        absorbed: false,
     }
 }
 
@@ -129,26 +168,25 @@ fn callback(
         rdev::EventType::MouseMove { x, y } => {
             let (x, y) = (x as i32, y as i32);
             if remote {
-                let cx = shared.cx.load(Ordering::Relaxed);
-                let cy = shared.cy.load(Ordering::Relaxed);
-                if shared.warp_pending.load(Ordering::Relaxed) && x == cx && y == cy {
-                    // Our own warp-to-centre landing: let it through so the OS
-                    // cursor actually moves, adopt it as the new reference, and
-                    // do not treat it as user motion.
-                    shared.warp_pending.store(false, Ordering::Relaxed);
-                    shared.lx.store(cx, Ordering::Relaxed);
-                    shared.ly.store(cy, Ordering::Relaxed);
-                    return Some(event);
-                }
+                let centre = (
+                    shared.cx.load(Ordering::Relaxed),
+                    shared.cy.load(Ordering::Relaxed),
+                );
                 let last = (
                     shared.lx.load(Ordering::Relaxed),
                     shared.ly.load(Ordering::Relaxed),
                 );
-                let motion = remote_motion((x, y), last, (cx, cy));
+                let warp_pending = shared.warp_pending.load(Ordering::Relaxed);
+                let motion = remote_motion((x, y), last, centre, warp_pending);
                 // Track the real position even while a warp is in flight, so
                 // events arriving before it lands still difference correctly.
                 shared.lx.store(x, Ordering::Relaxed);
                 shared.ly.store(y, Ordering::Relaxed);
+                if motion.absorbed {
+                    // Let it through so the OS cursor really moves to centre.
+                    shared.warp_pending.store(false, Ordering::Relaxed);
+                    return Some(event);
+                }
                 if motion.dx != 0 || motion.dy != 0 {
                     send(LocalEvent::Delta {
                         dx: motion.dx,
@@ -217,16 +255,20 @@ mod tests {
 
     const CENTRE: (i32, i32) = (960, 540);
 
-    /// The regression: with deltas measured from the centre, dragging steadily
-    /// made every event report the whole accumulated offset, so remote travel
-    /// grew as the square of real travel.
+    fn moved(pos: (i32, i32), last: (i32, i32)) -> Motion {
+        remote_motion(pos, last, CENTRE, false)
+    }
+
+    /// The original regression: with deltas measured from the centre, dragging
+    /// steadily made every event report the whole accumulated offset, so
+    /// remote travel grew as the square of real travel.
     #[test]
     fn steady_movement_produces_steady_deltas() {
         let mut last = CENTRE;
         let mut travelled = 0;
         for step in 1..=10 {
             let pos = (CENTRE.0 + step * 10, CENTRE.1);
-            let m = remote_motion(pos, last, CENTRE);
+            let m = moved(pos, last);
             assert_eq!(m.dy, 0);
             assert_eq!(m.dx, 10, "each event should report only its own movement");
             travelled += m.dx;
@@ -238,40 +280,62 @@ mod tests {
 
     #[test]
     fn motion_is_reported_in_both_directions() {
-        let m = remote_motion((950, 530), (960, 540), CENTRE);
+        let m = moved((950, 530), (960, 540));
         assert_eq!((m.dx, m.dy), (-10, -10));
     }
 
     #[test]
     fn a_still_pointer_reports_nothing() {
-        let m = remote_motion(CENTRE, CENTRE, CENTRE);
+        let m = moved(CENTRE, CENTRE);
         assert_eq!((m.dx, m.dy), (0, 0));
-        assert!(!m.recenter);
+        assert!(!m.recenter && !m.absorbed);
     }
 
     #[test]
-    fn drifting_towards_an_edge_asks_for_a_recentre() {
-        // Comfortably inside: no warp needed.
-        assert!(!remote_motion((1200, 540), (1190, 540), CENTRE).recenter);
-        // Past halfway to the edge: warp before the pointer can get stuck.
-        assert!(remote_motion((1500, 540), (1490, 540), CENTRE).recenter);
-        assert!(remote_motion((960, 60), (960, 70), CENTRE).recenter);
+    fn drifting_away_from_centre_asks_for_a_recentre() {
+        assert!(!moved((1100, 540), (1090, 540)).recenter);
+        assert!(moved((1250, 540), (1240, 540)).recenter);
+        assert!(moved((960, 300), (960, 310)).recenter);
     }
 
-    /// A warp landing is recognised by position, so the delta it would imply
-    /// is never sent — but motion arriving before it lands still differences
-    /// against the real previous position rather than the centre.
+    /// The jump: a warp landing a pixel off the centre used to miss the exact
+    /// match and forward the whole teleport distance as real movement.
     #[test]
-    fn movement_while_a_warp_is_in_flight_is_still_accurate() {
-        let last = (1500, 540);
-        let m = remote_motion((1505, 540), last, CENTRE);
-        assert_eq!(m.dx, 5, "not 545, which is the distance from centre");
+    fn a_warp_landing_slightly_off_centre_is_still_absorbed() {
+        let m = remote_motion((CENTRE.0 + 3, CENTRE.1 - 2), (1250, 540), CENTRE, true);
+        assert!(m.absorbed, "must be recognised as our warp, not a 290px flick");
+        assert_eq!((m.dx, m.dy), (0, 0));
     }
 
-    /// A tiny screen must not produce a zero margin and warp on every event.
+    /// If the warp arrives coalesced with motion it will not be near the
+    /// centre, but no hand crosses that distance in one event either.
+    #[test]
+    fn a_warp_coalesced_with_motion_is_absorbed_by_size() {
+        let m = remote_motion((700, 540), (1400, 540), CENTRE, true);
+        assert!(m.absorbed);
+    }
+
+    /// A pending warp must not swallow ordinary movement that happens while it
+    /// is still in flight.
+    #[test]
+    fn small_movement_while_a_warp_is_in_flight_is_kept() {
+        let m = remote_motion((1255, 540), (1250, 540), CENTRE, true);
+        assert!(!m.absorbed);
+        assert_eq!(m.dx, 5, "not the 295px distance from centre");
+    }
+
+    /// Without a warp outstanding nothing may be discarded, however far the
+    /// pointer appears to have travelled.
+    #[test]
+    fn a_large_move_is_never_absorbed_unless_a_warp_is_pending() {
+        let m = moved(CENTRE, (1500, 540));
+        assert!(!m.absorbed);
+        assert_eq!(m.dx, -540);
+    }
+
     #[test]
     fn a_small_screen_still_has_a_usable_margin() {
         let centre = (1, 1);
-        assert!(!remote_motion((1, 1), (1, 1), centre).recenter);
+        assert!(!remote_motion((1, 1), (1, 1), centre, false).recenter);
     }
 }
