@@ -133,6 +133,13 @@ releases.
   and net runtime both write it).
 - **ScrollLock is the panic key** and is intercepted in capture, never
   forwarded, so it works even when the focused peer is wedged.
+- **A key press and its release are separate messages, so anything in between
+  can strand one.** The controlled side tracks `held_keys`/`held_buttons` and
+  releases them on `Leave` and on `PeerDown`; that half must keep working
+  without cooperation, because a killed controller cannot send anything. The
+  controller also releases modifiers and sends `Leave` from
+  `EngineIn::Shutdown` for the clean case. Symptom when this breaks: a stuck
+  Ctrl, after which Esc opens the Windows start menu.
 - Mesh membership is proven by a blake3 keyed hash bound to *both* endpoint
   ids of the connection ([mesh.rs](crates/mousefinity/src/mesh.rs)) — the
   secret never crosses the wire and proofs can't be replayed to another pair.

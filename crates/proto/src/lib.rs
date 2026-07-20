@@ -35,7 +35,10 @@ pub enum ProtoError {
 }
 
 /// Mouse buttons, platform-neutral.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Hash` so the controlled side can keep a set of what is currently held and
+/// release it if the link dies mid-press.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Button {
     Left,
     Right,
@@ -50,7 +53,7 @@ pub enum Button {
 /// Letters and digits refer to *physical* keys in US-QWERTY positions; the
 /// receiving side decides how to inject them. `Unicode` carries a resolved
 /// character when the sender knows it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Key {
     Alt,
     AltGr,

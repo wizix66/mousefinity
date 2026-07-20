@@ -442,6 +442,18 @@ fn cmd_mesh_join(ticket: &str) -> Result<()> {
     Ok(())
 }
 
+/// Hand control back, release held keys, then leave.
+///
+/// The pause is for the releases and the `Leave` to reach the peer: they go
+/// out over the network, and exiting immediately would drop them from the
+/// send queue — which is exactly the situation this exists to avoid.
+fn graceful_exit(engine_tx: &tokio::sync::mpsc::UnboundedSender<engine::EngineIn>, why: &str) -> ! {
+    info!("{why}; releasing input and disconnecting");
+    let _ = engine_tx.send(engine::EngineIn::Shutdown);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    std::process::exit(0);
+}
+
 fn cmd_run() -> Result<()> {
     let cfg = config::load()?;
     let secret = config::load_or_create_secret()?;
@@ -487,6 +499,7 @@ fn cmd_run() -> Result<()> {
         .spawn(move || engine.run(engine_rx))?;
 
     let net_engine_tx = engine_tx.clone();
+    let shutdown_tx = engine_tx.clone();
     std::thread::Builder::new().name("net".into()).spawn(move || {
         let rt = match tokio::runtime::Runtime::new() {
             Ok(rt) => rt,
@@ -505,9 +518,44 @@ fn cmd_run() -> Result<()> {
             };
             info!("pairing id: {}", net.id());
             tokio::spawn(ipc::serve(net.clone()));
+            // Ctrl-C is how most people stop a foreground daemon, and the
+            // default handler kills the process outright — leaving whatever
+            // key was held down still held on the machine being driven.
+            let sig_tx = shutdown_tx.clone();
+            tokio::spawn(async move {
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    println!();
+                    graceful_exit(&sig_tx, "interrupted");
+                }
+            });
             net.run().await;
         });
     })?;
+
+    // `q` on stdin as the deliberate way out. Reading a line rather than a
+    // raw key: the global grab already owns the keyboard, and a bare `q`
+    // hotkey would mean never being able to type the letter anywhere.
+    let quit_tx = engine_tx.clone();
+    std::thread::Builder::new()
+        .name("quit-watch".into())
+        .spawn(move || {
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match std::io::stdin().read_line(&mut line) {
+                    // stdin closed (service, nohup, piped): nothing to watch.
+                    Ok(0) => return,
+                    Ok(_) => {
+                        let cmd = line.trim();
+                        if cmd.eq_ignore_ascii_case("q") || cmd.eq_ignore_ascii_case("quit") {
+                            graceful_exit(&quit_tx, "quit requested");
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+        })?;
+    println!("running — press `q` then Enter to stop, or Ctrl-C");
 
     // Blocks forever; must be the main thread (macOS event tap requirement).
     capture::run(shared, engine_tx);

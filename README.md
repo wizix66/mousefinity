@@ -113,6 +113,15 @@ Push the cursor off desktop's right edge — it lands on the laptop. Keyboard,
 mouse buttons and scrolling follow the cursor. Copy text on one machine,
 paste on the other. ScrollLock instantly returns control home.
 
+To stop the daemon, press **`q` then Enter**, or Ctrl-C. Either way it hands
+control back and releases any key still held before exiting — otherwise a
+modifier that was down when it stopped stays down on the machine being driven,
+and a stuck Ctrl makes Esc open the Start menu.
+
+A host also releases anything a peer was holding when that peer disconnects,
+so a controller that is killed outright, crashes, or drops off the network
+cannot leave a keyboard wedged either.
+
 Send a file to whichever peer you like (daemon must be running):
 
 ```sh

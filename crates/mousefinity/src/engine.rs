@@ -45,6 +45,9 @@ pub enum EngineIn {
     PeerDown { name: String, epoch: u64 },
     /// The config on disk changed (IPC reload): adopt if newer and gossip.
     SetLayout { rev: u64, layout: Layout },
+    /// Wind down before the process exits: hand control back and let go of
+    /// anything still held, here and on the peer being driven.
+    Shutdown,
 }
 
 struct Peer {
@@ -73,6 +76,14 @@ pub struct Engine {
     /// every mouse event at the edge, so the explanation has to be said once
     /// rather than thousands of times.
     warned_unreachable: std::collections::HashSet<String>,
+    /// What this host is currently holding down on behalf of the peer driving
+    /// it. Nothing else knows: a key press arrives as one message and its
+    /// release as another, so a link that dies in between leaves the key down
+    /// with no record that it ever went down. A stuck Ctrl is the usual
+    /// result, after which Esc opens the start menu and the keyboard appears
+    /// to have gone mad.
+    held_keys: std::collections::HashSet<Key>,
+    held_buttons: std::collections::HashSet<Button>,
 }
 
 impl Engine {
@@ -96,6 +107,8 @@ impl Engine {
             inject,
             clip: Clip::new(),
             warned_unreachable: std::collections::HashSet::new(),
+            held_keys: std::collections::HashSet::new(),
+            held_buttons: std::collections::HashSet::new(),
         }
     }
 
@@ -142,11 +155,54 @@ impl Engine {
                 }
                 if self.controlled_by.as_deref() == Some(name.as_str()) {
                     self.controlled_by = None;
+                    // The peer driving this host vanished — killed, crashed or
+                    // disconnected — so it can never send the releases itself.
+                    self.release_held();
                 }
             }
             EngineIn::PeerMsg { name, msg } => self.on_peer(name, msg),
             EngineIn::SetLayout { rev, layout } => self.adopt_layout(rev, layout, None),
+            EngineIn::Shutdown => self.shutdown(),
         }
+    }
+
+    /// Leave both ends in a usable state.
+    ///
+    /// The peer being driven is holding whatever this host last sent down, and
+    /// once this process is gone nothing will ever tell it otherwise — so send
+    /// the releases explicitly rather than relying on the disconnect being
+    /// noticed. Then hand control back, so the cursor is not parked on a
+    /// screen that no longer has a driver.
+    fn shutdown(&mut self) {
+        if let Focus::Remote { name, .. } = &self.focus {
+            let name = name.clone();
+            info!("handing control back to {} before exit", self.my_name);
+            if let Some(peer) = self.peers.get(&name) {
+                for key in [
+                    Key::ControlLeft,
+                    Key::ControlRight,
+                    Key::ShiftLeft,
+                    Key::ShiftRight,
+                    Key::Alt,
+                    Key::AltGr,
+                    Key::MetaLeft,
+                    Key::MetaRight,
+                ] {
+                    let _ = peer.tx.send(Msg::Key { key, down: false });
+                }
+                for button in [Button::Left, Button::Right, Button::Middle] {
+                    let _ = peer.tx.send(Msg::Button {
+                        button,
+                        down: false,
+                    });
+                }
+                let _ = peer.tx.send(Msg::Leave);
+            }
+            self.return_local_center();
+        }
+        // And anything a peer was holding down on this host.
+        self.controlled_by = None;
+        self.release_held();
     }
 
     /// Adopt a layout if its revision is strictly newer than ours, persist it,
@@ -187,6 +243,31 @@ impl Engine {
                     layout: layout.clone(),
                 });
             }
+        }
+    }
+
+    /// Let go of everything held on behalf of a controlling peer.
+    ///
+    /// Injecting a release for a key that is not actually down is harmless, so
+    /// this errs towards releasing rather than tracking perfectly.
+    fn release_held(&mut self) {
+        if self.held_keys.is_empty() && self.held_buttons.is_empty() {
+            return;
+        }
+        warn!(
+            "releasing {} key(s) and {} button(s) still held by the peer that \
+             was driving this host",
+            self.held_keys.len(),
+            self.held_buttons.len()
+        );
+        for key in self.held_keys.drain() {
+            let _ = self.inject.send(InjectCmd::Key { key, down: false });
+        }
+        for button in self.held_buttons.drain() {
+            let _ = self.inject.send(InjectCmd::Button {
+                button,
+                down: false,
+            });
         }
     }
 
@@ -395,6 +476,9 @@ impl Engine {
             Msg::Leave => {
                 if self.controlled_by.as_deref() == Some(name.as_str()) {
                     self.controlled_by = None;
+                    // Hopping away mid-chord is ordinary: a held modifier must
+                    // not be left down on a screen nobody is driving.
+                    self.release_held();
                     // The user may have copied something here; hand it back.
                     let clip_msg = self.clip.get_text().map(|text| Msg::Clipboard { text });
                     if let (Some(m), Some(peer)) = (clip_msg, self.peers.get(&name)) {
@@ -409,11 +493,21 @@ impl Engine {
             }
             Msg::Button { button, down } => {
                 if self.controlled_by.as_deref() == Some(name.as_str()) {
+                    if down {
+                        self.held_buttons.insert(button);
+                    } else {
+                        self.held_buttons.remove(&button);
+                    }
                     let _ = self.inject.send(InjectCmd::Button { button, down });
                 }
             }
             Msg::Key { key, down } => {
                 if self.controlled_by.as_deref() == Some(name.as_str()) {
+                    if down {
+                        self.held_keys.insert(key);
+                    } else {
+                        self.held_keys.remove(&key);
+                    }
                     let _ = self.inject.send(InjectCmd::Key { key, down });
                 }
             }
@@ -518,6 +612,133 @@ mod tests {
     /// gossips that at a winning revision. Adopting it would silently unlink
     /// every screen here, which looks exactly like "it connects but the cursor
     /// will not cross".
+    /// Drain whatever the injector has been told to do so far.
+    fn drain_inject(rig: &mut Rig) -> Vec<InjectCmd> {
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        let mut out = Vec::new();
+        while let Ok(cmd) = rig.inject_rx.try_recv() {
+            out.push(cmd);
+        }
+        out
+    }
+
+    fn control_us_holding_ctrl(rig: &Rig) {
+        rig.tx
+            .send(EngineIn::PeerMsg {
+                name: "b".into(),
+                msg: Msg::Enter { x: 10, y: 10 },
+            })
+            .unwrap();
+        rig.tx
+            .send(EngineIn::PeerMsg {
+                name: "b".into(),
+                msg: Msg::Key {
+                    key: Key::ControlLeft,
+                    down: true,
+                },
+            })
+            .unwrap();
+    }
+
+    /// The reported bug: the controlling host dies mid-chord, so the release
+    /// never arrives and Ctrl stays down here forever. On Windows that makes
+    /// Esc open the start menu, which reads as a scrambled keyboard.
+    #[test]
+    fn a_peer_that_vanishes_does_not_leave_its_keys_held() {
+        let mut r = rig();
+        control_us_holding_ctrl(&r);
+        drain_inject(&mut r);
+
+        r.tx.send(EngineIn::PeerDown {
+            name: "b".into(),
+            epoch: 1,
+        })
+        .unwrap();
+
+        let released: Vec<_> = drain_inject(&mut r)
+            .into_iter()
+            .filter(|c| matches!(c, InjectCmd::Key { key: Key::ControlLeft, down: false }))
+            .collect();
+        assert_eq!(released.len(), 1, "ctrl must be released when the peer drops");
+    }
+
+    /// Hopping away with a modifier held is ordinary use, and must not strand
+    /// it either.
+    #[test]
+    fn leaving_releases_what_was_held() {
+        let mut r = rig();
+        control_us_holding_ctrl(&r);
+        drain_inject(&mut r);
+
+        r.tx.send(EngineIn::PeerMsg {
+            name: "b".into(),
+            msg: Msg::Leave,
+        })
+        .unwrap();
+
+        assert!(
+            drain_inject(&mut r).iter().any(|c| matches!(
+                c,
+                InjectCmd::Key { key: Key::ControlLeft, down: false }
+            )),
+            "ctrl must be released when the cursor leaves"
+        );
+    }
+
+    /// A key released normally must not be released twice on the way out.
+    #[test]
+    fn a_key_released_normally_is_forgotten() {
+        let mut r = rig();
+        control_us_holding_ctrl(&r);
+        r.tx.send(EngineIn::PeerMsg {
+            name: "b".into(),
+            msg: Msg::Key {
+                key: Key::ControlLeft,
+                down: false,
+            },
+        })
+        .unwrap();
+        drain_inject(&mut r);
+
+        r.tx.send(EngineIn::PeerDown {
+            name: "b".into(),
+            epoch: 1,
+        })
+        .unwrap();
+        assert!(
+            drain_inject(&mut r).is_empty(),
+            "nothing was still held, so nothing should be released"
+        );
+    }
+
+    /// Shutting down while driving a peer must tell it to let go, since after
+    /// this process exits nothing ever will.
+    #[test]
+    fn shutdown_releases_modifiers_on_the_peer_being_driven() {
+        let mut r = rig();
+        r.tx.send(EngineIn::Local(LocalEvent::Move { x: 999, y: 500 }))
+            .unwrap();
+        match recv(&mut r.peer_rx) {
+            Msg::Enter { .. } => {}
+            other => panic!("expected to hop first, got {other:?}"),
+        }
+
+        r.tx.send(EngineIn::Shutdown).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        let mut released_ctrl = false;
+        let mut left = false;
+        while let Ok(msg) = r.peer_rx.try_recv() {
+            match msg {
+                Msg::Key { key: Key::ControlLeft, down: false } => released_ctrl = true,
+                Msg::Leave => left = true,
+                _ => {}
+            }
+        }
+        assert!(released_ctrl, "modifiers must be released on the driven peer");
+        assert!(left, "the peer must be told the cursor is gone");
+    }
+
     #[test]
     fn an_empty_layout_from_a_peer_does_not_wipe_a_working_one() {
         let mut r = rig();
