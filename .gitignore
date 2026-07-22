@@ -1,5 +1,4 @@
 /target
-.DS_Store
 daemon.err
 daemon.out
 probe.txt
@@ -19,3 +18,53 @@ probe.txt
 # licences actually require it to be. A committed copy would go stale on each
 # dependency bump without anything noticing.
 THIRD-PARTY-LICENSES.md
+
+# Droppings from desktop environments and file managers. This project is
+# developed from macOS, Windows and Linux machines at once, and every one of
+# these is written by the OS on its own — often just by looking at a folder —
+# so they arrive without anyone deciding to add them. They say nothing about
+# the project and are listed for all three platforms on every platform, since
+# whoever's machine creates one is not the one who notices it.
+
+# macOS. `.DS_Store` holds Finder's per-folder view settings; `._*` are
+# AppleDouble sidecars that carry resource forks onto non-HFS filesystems,
+# and `Icon\r` really does end in a carriage return.
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Icon?
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# Windows. Thumbs.db and its variants are Explorer's thumbnail caches;
+# desktop.ini holds per-folder appearance; *.stackdump is a Cygwin crash dump.
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.stackdump
+*.lnk
+
+# Linux. `.directory` is Dolphin's per-folder settings, `.Trash-*` the
+# per-user trash on a shared mount, and `.nfs*`/`.fuse_hidden*` appear when a
+# still-open file is deleted on those filesystems.
+.directory
+.Trash-*
+.nfs*
+.fuse_hidden*
+
+# Editor leftovers of the same accidental kind: swap files and backups written
+# beside the file being edited. Editor *configuration* directories are left
+# out on purpose — those are a choice a project makes, not something an OS
+# does behind your back.
+*~
+*.swp
+*.swo
