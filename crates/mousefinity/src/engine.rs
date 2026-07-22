@@ -31,6 +31,10 @@ pub enum LocalEvent {
     Recenter,
     /// ScrollLock pressed: force control back to this host.
     EmergencyRelease,
+    /// Capture needs to know where the pointer really is, to settle whether
+    /// swallowing a move event on this OS moves it at all. Only the injector
+    /// can answer, and it answers capture directly.
+    WhereIsPointer,
 }
 
 pub enum EngineIn {
@@ -313,6 +317,9 @@ impl Engine {
                         y: self.my_screen.1 as i32 / 2,
                     });
                 }
+            }
+            LocalEvent::WhereIsPointer => {
+                let _ = self.inject.send(InjectCmd::WhereIsPointer);
             }
             LocalEvent::EmergencyRelease => {
                 if !matches!(self.focus, Focus::Local) {

@@ -99,10 +99,18 @@ releases.
   cursor across every screen and streams absolute positions; controlled peers
   never make hop decisions. Breaking this reintroduces feedback loops from
   injected events.
-- **While remote, motion is the difference between consecutive hook events**,
-  never the offset from screen centre — suppressing an event does not pin the
-  pointer, so a fixed reference re-reports accumulated drift and the remote
-  cursor accelerates away.
+- **Whether swallowing a move event pins the pointer is measured, not
+  assumed.** Where it drifts (macOS, X11) motion is the difference between
+  consecutive hook events; a fixed reference would re-report accumulated drift
+  and the remote cursor accelerates away. Where it pins (Windows) the opposite
+  holds: every event reports the same origin plus its own movement, so
+  differencing yields the change in *speed*, which sums to nothing over a
+  steady drag — the symptom was a remote cursor stuck in a few pixels beside
+  the edge it entered by. `Suppression` in
+  [capture.rs](crates/mousefinity/src/capture.rs) settles this per process by
+  asking the injector where the pointer really is, and the anchor it compares
+  against must be a position the pointer was *known* to occupy (the centre it
+  was warped to), never one a hook event merely reported.
 - **Which event was our own warp is not decided from coordinates.** A warp
   landing slightly off is indistinguishable from a fast flick; two attempts at
   telling them apart both leaked the teleport distance to the far screen as a

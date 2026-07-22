@@ -4,14 +4,32 @@
 //! cursor is on a remote screen, all input is swallowed locally and forwarded
 //! to the engine as deltas.
 //!
-//! Those deltas are differences between consecutive hook events, not offsets
-//! from the screen centre. Suppressing an event does not reliably pin the
-//! pointer, so it drifts; measuring from a fixed centre would then re-report
-//! the accumulated offset on every event and send the remote cursor flying.
+//! Whether swallowing a move event leaves the pointer where it was is an OS
+//! decision, and the two answers need opposite arithmetic:
 //!
-//! The pointer is warped back to the centre once it strays past a quarter of
-//! the way to an edge — so it cannot reach one and go silent, and so it does
-//! not visibly wander while parked.
+//! - **The pointer drifts** (macOS, X11). Consecutive hook events accumulate,
+//!   so motion is the difference between them. Measuring from a fixed centre
+//!   would re-report the whole accumulated offset on every event and send the
+//!   remote cursor flying.
+//! - **The pointer is pinned** (Windows: a low-level hook that swallows the
+//!   event leaves the cursor in place, and the next event reports that same
+//!   fixed origin plus its own movement). Differencing consecutive events then
+//!   yields the *change* in speed — near zero for a steady drag — so the remote
+//!   cursor jitters a few pixels around where it entered and can only leave by
+//!   the edge it came in through. Motion here is the offset from the anchor.
+//!
+//! Which one this machine does is settled by measurement, not by `cfg`: once a
+//! swallowed event reports a position away from the centre the hop warped the
+//! pointer to, the injector is asked where the pointer actually is. Still on
+//! that centre means suppression pins it; anywhere else means it drifts. The answer holds for the process lifetime,
+//! and until it arrives the drifting rule applies — the two agree on the first
+//! event after a hop, so the cost of guessing wrong for a millisecond is a
+//! couple of jittered events.
+//!
+//! While drifting, the pointer is warped back to the centre once it strays past
+//! a quarter of the way to an edge — so it cannot reach one and go silent, and
+//! so it does not visibly wander while parked. While pinned it never moves at
+//! all, so none of that applies.
 //!
 //! A warp breaks the difference between consecutive events, and which event
 //! *was* the warp cannot be decided from coordinates: one landing slightly off
@@ -24,7 +42,7 @@
 //! pointer, which keeps the number of discarded events near zero, but nothing
 //! depends on that report arriving.
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::mpsc::UnboundedSender;
@@ -54,6 +72,38 @@ pub struct CaptureShared {
     /// Set once injection is known to be unavailable; warps are then never
     /// waited for, since nothing can perform them.
     can_warp: AtomicBool,
+    /// What suppressing a move event does to the pointer here, as a
+    /// [`Suppression`] discriminant. Measured once, then reused: it is a
+    /// property of the OS, not of this hop.
+    suppression: AtomicU8,
+    /// A location probe has been asked for and not answered yet.
+    probe_pending: AtomicBool,
+    /// Where the pointer was known to be when that probe was requested. The
+    /// probe answers the question by landing on this or not.
+    probe_ax: AtomicI32,
+    probe_ay: AtomicI32,
+}
+
+/// What swallowing a move event does to the pointer on this machine.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Suppression {
+    /// Not measured yet. Treated as [`Suppression::Drifts`] meanwhile, which
+    /// is right for the first event after a hop either way.
+    Unknown = 0,
+    /// The pointer moves anyway, so hook events accumulate.
+    Drifts = 1,
+    /// The pointer stays put, so every hook event reports the same origin.
+    Pins = 2,
+}
+
+impl Suppression {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Suppression::Drifts,
+            2 => Suppression::Pins,
+            _ => Suppression::Unknown,
+        }
+    }
 }
 
 impl CaptureShared {
@@ -79,6 +129,68 @@ impl CaptureShared {
     pub fn set_local(&self) {
         self.remote.store(false, Ordering::SeqCst);
         self.warp_pending.store(false, Ordering::Relaxed);
+        // An answer arriving after the hop ended would be compared against an
+        // anchor the pointer has since been warped away from, and would latch
+        // the wrong rule for the rest of the process.
+        self.probe_pending.store(false, Ordering::Relaxed);
+    }
+
+    fn suppression(&self) -> Suppression {
+        Suppression::from_u8(self.suppression.load(Ordering::Relaxed))
+    }
+
+    /// Ask, once, where the pointer really is. `anchor` is the last position
+    /// the pointer is *known* to have occupied — the centre it was warped to,
+    /// never a position merely reported by a hook event. Returns whether a
+    /// probe should actually be sent.
+    fn want_probe(&self, anchor: (i32, i32)) -> bool {
+        if self.suppression() != Suppression::Unknown {
+            return false;
+        }
+        if self.probe_pending.swap(true, Ordering::Relaxed) {
+            return false;
+        }
+        self.probe_ax.store(anchor.0, Ordering::Relaxed);
+        self.probe_ay.store(anchor.1, Ordering::Relaxed);
+        true
+    }
+
+    /// The injector's answer: where the pointer actually is.
+    ///
+    /// Still on the anchor means the swallowed event moved nothing. Anywhere
+    /// else means it moved — including further along than the event reported,
+    /// which is why this asks "did it stay?" rather than "did it land where
+    /// the event said?".
+    pub fn note_pointer_location(&self, x: i32, y: i32) {
+        if !self.probe_pending.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        let anchor = (
+            self.probe_ax.load(Ordering::Relaxed),
+            self.probe_ay.load(Ordering::Relaxed),
+        );
+        let mode = if (x, y) == anchor {
+            Suppression::Pins
+        } else {
+            Suppression::Drifts
+        };
+        debug!(
+            "suppressed motion leaves the pointer at {:?}; it was at {anchor:?}, so it {}",
+            (x, y),
+            match mode {
+                Suppression::Pins => "pins — measuring motion from the anchor",
+                _ => "drifts — measuring motion between events",
+            }
+        );
+        self.suppression.store(mode as u8, Ordering::Relaxed);
+    }
+
+    /// Nothing can answer a probe, so stop asking and keep the drifting rule,
+    /// which is what every release before this one used everywhere.
+    pub fn note_probe_unavailable(&self) {
+        self.probe_pending.store(false, Ordering::Relaxed);
+        self.suppression
+            .store(Suppression::Drifts as u8, Ordering::Relaxed);
     }
 
     /// Called by the inject thread once a warp has actually been performed.
@@ -90,10 +202,13 @@ impl CaptureShared {
         self.warp_pending.store(false, Ordering::Relaxed);
     }
 
-    /// No injector, so no warps will ever land: stop waiting for them.
+    /// No injector, so no warps will ever land: stop waiting for them. The
+    /// same injector is what would answer a location probe, so that question
+    /// cannot be asked either.
     pub fn injection_unavailable(&self) {
         self.can_warp.store(false, Ordering::Relaxed);
         self.warp_pending.store(false, Ordering::Relaxed);
+        self.note_probe_unavailable();
     }
 
     pub fn is_remote(&self) -> bool {
@@ -128,13 +243,16 @@ const MAX_STEP: i32 = 6;
 /// real movement and would reach the far screen as a jump.
 const RECENTRE_AT: i32 = 4;
 
-/// Movement is the difference between consecutive events, never the offset
-/// from the centre.
+/// Movement is the difference between consecutive events — unless suppressing
+/// an event pins the pointer, in which case it is the offset from the anchor
+/// the pointer is pinned to.
 ///
-/// Measuring from the centre is only correct if the pointer is warped back
-/// after every single event. It is not, so the offset keeps growing and each
-/// event re-reports the whole accumulated distance; travel then grows
-/// quadratically.
+/// Where the pointer drifts, measuring from the centre is only correct if it is
+/// warped back after every single event. It is not, so the offset keeps growing
+/// and each event re-reports the whole accumulated distance; travel then grows
+/// quadratically. Where the pointer is pinned the opposite holds: nothing
+/// accumulates, so differencing consecutive events reports `dᵢ - dᵢ₋₁`, which
+/// sums to nothing over a steady drag.
 ///
 /// Rather than trying to work out *which* event was the warp — undecidable
 /// from coordinates, since a warp landing slightly off is indistinguishable
@@ -143,9 +261,18 @@ const RECENTRE_AT: i32 = 4;
 /// generates a hook event at all. The cost of a discarded event is a few
 /// pixels of travel, once per warp; the cost of a wrong guess was the pointer
 /// leaping across the far screen.
-fn remote_motion(pos: (i32, i32), last: (i32, i32), centre: (i32, i32)) -> Motion {
-    let dx = pos.0 - last.0;
-    let dy = pos.1 - last.1;
+fn remote_motion(
+    pos: (i32, i32),
+    last: (i32, i32),
+    centre: (i32, i32),
+    mode: Suppression,
+) -> Motion {
+    // Pinned, the pointer never left the centre, so that is where this event's
+    // movement is measured from — and there is nothing to warp back.
+    let pinned = mode == Suppression::Pins;
+    let reference = if pinned { centre } else { last };
+    let dx = pos.0 - reference.0;
+    let dy = pos.1 - reference.1;
     // Keep the pointer near the middle of the screen: it is visible the whole
     // time it is parked, and one wandering off on its own looks broken even
     // when the remote cursor is behaving.
@@ -164,7 +291,8 @@ fn remote_motion(pos: (i32, i32), last: (i32, i32), centre: (i32, i32)) -> Motio
     Motion {
         dx,
         dy,
-        recenter: (pos.0 - centre.0).abs() > stray_x || (pos.1 - centre.1).abs() > stray_y,
+        recenter: !pinned
+            && ((pos.0 - centre.0).abs() > stray_x || (pos.1 - centre.1).abs() > stray_y),
         implausible: false,
     }
 }
@@ -221,9 +349,10 @@ fn callback(
                     shared.lx.load(Ordering::Relaxed),
                     shared.ly.load(Ordering::Relaxed),
                 );
-                let motion = remote_motion((x, y), last, centre);
+                let motion = remote_motion((x, y), last, centre, shared.suppression());
                 // Always resync the reference, including on a discarded step:
-                // the pointer really is here, whatever put it here.
+                // the pointer really is here, whatever put it here. (Pinned,
+                // it is not, and this is ignored.)
                 shared.lx.store(x, Ordering::Relaxed);
                 shared.ly.store(y, Ordering::Relaxed);
                 if motion.implausible {
@@ -245,6 +374,17 @@ fn callback(
                         dx: motion.dx,
                         dy: motion.dy,
                     });
+                }
+                // This event is about to be swallowed and it reports a
+                // position away from the centre, so motion has happened since
+                // the hop warped the pointer there: ask where the pointer
+                // actually ended up. The centre is the anchor because it is
+                // the last place the pointer is *known* to have been — the
+                // previous event's coordinates are only where it was reported,
+                // which on a pinning machine is not where it is. Asked once
+                // per process, and only until an answer arrives.
+                if (x, y) != centre && shared.want_probe(centre) {
+                    send(LocalEvent::WhereIsPointer);
                 }
                 // `swap` keeps this to one warp request in flight at a time.
                 if motion.recenter && !shared.warp_pending.swap(true, Ordering::Relaxed) {
@@ -319,7 +459,7 @@ mod tests {
         let mut travelled = 0;
         for step in 1..=10 {
             let pos = (CENTRE.0 + step * 10, CENTRE.1);
-            let m = remote_motion(pos, last, CENTRE);
+            let m = remote_motion(pos, last, CENTRE, Suppression::Drifts);
             assert_eq!(m.dy, 0);
             assert_eq!(m.dx, 10, "each event should report only its own movement");
             travelled += m.dx;
@@ -330,23 +470,23 @@ mod tests {
 
     #[test]
     fn motion_is_reported_in_both_directions() {
-        let m = remote_motion((950, 530), (960, 540), CENTRE);
+        let m = remote_motion((950, 530), (960, 540), CENTRE, Suppression::Drifts);
         assert_eq!((m.dx, m.dy), (-10, -10));
         assert!(!m.implausible);
     }
 
     #[test]
     fn a_still_pointer_reports_nothing() {
-        let m = remote_motion(CENTRE, CENTRE, CENTRE);
+        let m = remote_motion(CENTRE, CENTRE, CENTRE, Suppression::Drifts);
         assert_eq!((m.dx, m.dy), (0, 0));
         assert!(!m.recenter && !m.implausible);
     }
 
     #[test]
     fn drifting_away_from_centre_asks_for_a_recentre() {
-        assert!(!remote_motion((1100, 540), (1090, 540), CENTRE).recenter);
-        assert!(remote_motion((1250, 540), (1240, 540), CENTRE).recenter);
-        assert!(remote_motion((960, 300), (960, 310), CENTRE).recenter);
+        assert!(!remote_motion((1100, 540), (1090, 540), CENTRE, Suppression::Drifts).recenter);
+        assert!(remote_motion((1250, 540), (1240, 540), CENTRE, Suppression::Drifts).recenter);
+        assert!(remote_motion((960, 300), (960, 310), CENTRE, Suppression::Drifts).recenter);
     }
 
     /// The jump, whichever way round it happens: a warp is always longer than
@@ -361,7 +501,7 @@ mod tests {
         );
         // Warping in from the recentre threshold, in either direction.
         for from in [(CENTRE.0 + stray, CENTRE.1), (CENTRE.0 - stray, CENTRE.1)] {
-            let m = remote_motion(CENTRE, from, CENTRE);
+            let m = remote_motion(CENTRE, from, CENTRE, Suppression::Drifts);
             assert!(m.implausible, "warp from {from:?} must be discarded");
             assert_eq!((m.dx, m.dy), (0, 0));
         }
@@ -372,7 +512,7 @@ mod tests {
     #[test]
     fn a_warp_landing_anywhere_near_centre_is_still_discarded() {
         for landing in [(957, 543), (960, 540), (975, 520), (940, 560)] {
-            let m = remote_motion(landing, (1250, 540), CENTRE);
+            let m = remote_motion(landing, (1250, 540), CENTRE, Suppression::Drifts);
             assert!(m.implausible, "landing at {landing:?} must be discarded");
         }
     }
@@ -383,6 +523,7 @@ mod tests {
             (CENTRE.0 + BIGGEST_ALLOWED_STEP, CENTRE.1),
             CENTRE,
             CENTRE,
+            Suppression::Drifts,
         );
         assert!(!m.implausible, "a fast hand must not be mistaken for a warp");
         assert_eq!(m.dx, BIGGEST_ALLOWED_STEP);
@@ -394,6 +535,7 @@ mod tests {
             (CENTRE.0 + BIGGEST_ALLOWED_STEP + 1, CENTRE.1),
             CENTRE,
             CENTRE,
+            Suppression::Drifts,
         );
         assert!(m.implausible);
     }
@@ -401,7 +543,7 @@ mod tests {
     #[test]
     fn a_small_screen_still_has_a_usable_margin() {
         let centre = (1, 1);
-        assert!(!remote_motion((1, 1), (1, 1), centre).recenter);
+        assert!(!remote_motion((1, 1), (1, 1), centre, Suppression::Drifts).recenter);
     }
 
     /// With no injector there is nothing to warp, so hopping must not leave
@@ -422,5 +564,124 @@ mod tests {
         assert!(!shared.warp_pending.load(Ordering::Relaxed));
         assert_eq!(shared.lx.load(Ordering::Relaxed), CENTRE.0);
         assert_eq!(shared.ly.load(Ordering::Relaxed), CENTRE.1);
+    }
+
+    /// The Windows bug: a swallowed event leaves the pointer at the centre, so
+    /// every event reports centre + its own movement. Differencing those
+    /// reports the *change* in speed, which sums to nothing over a steady drag
+    /// — the remote cursor sat in a few pixels near the edge it came in
+    /// through and could only go back the way it arrived.
+    #[test]
+    fn a_pinned_pointer_reports_each_step_not_the_change_in_speed() {
+        let mut travelled = 0;
+        for _ in 0..10 {
+            // Same hand movement every time, so the pinned pointer reports the
+            // same position every time.
+            let pos = (CENTRE.0 + 10, CENTRE.1);
+            let m = remote_motion(pos, pos, CENTRE, Suppression::Pins);
+            assert_eq!(m.dx, 10, "each event must report its own movement");
+            travelled += m.dx;
+        }
+        assert_eq!(travelled, 100, "100px of hand movement, not 10 then nothing");
+    }
+
+    /// Nothing moved it, so there is nothing to move back — and warping would
+    /// shift the very anchor that motion is measured from, turning the next
+    /// hand movement into the warp distance plus itself.
+    #[test]
+    fn a_pinned_pointer_is_never_recentred() {
+        let far = (CENTRE.0 + CENTRE.0 / RECENTRE_AT + 1, CENTRE.1);
+        // Crept out there a pixel at a time, so the step itself is plausible.
+        let last = (far.0 - 1, far.1);
+        assert!(remote_motion(far, last, CENTRE, Suppression::Drifts).recenter);
+        assert!(!remote_motion(far, last, CENTRE, Suppression::Pins).recenter);
+    }
+
+    /// Both rules agree on the first event after a hop, which is what makes it
+    /// safe to keep measuring while the probe is still in flight.
+    #[test]
+    fn the_two_rules_agree_on_the_first_event_after_a_hop() {
+        let pos = (CENTRE.0 + 7, CENTRE.1 - 3);
+        let drifts = remote_motion(pos, CENTRE, CENTRE, Suppression::Drifts);
+        let pins = remote_motion(pos, CENTRE, CENTRE, Suppression::Pins);
+        assert_eq!((drifts.dx, drifts.dy), (pins.dx, pins.dy));
+        assert_eq!(
+            remote_motion(pos, CENTRE, CENTRE, Suppression::Unknown).dx,
+            drifts.dx,
+            "an unmeasured machine must behave as every release before this one did"
+        );
+    }
+
+    #[test]
+    fn a_pointer_still_on_the_anchor_means_suppression_pins_it() {
+        let shared = CaptureShared::new();
+        shared.set_remote(CENTRE);
+        assert!(shared.want_probe(CENTRE));
+        shared.note_pointer_location(CENTRE.0, CENTRE.1);
+        assert_eq!(shared.suppression(), Suppression::Pins);
+    }
+
+    /// It need not have landed where the event said — under a suppressed drift
+    /// it keeps moving while the probe is in flight — only somewhere else.
+    #[test]
+    fn a_pointer_that_moved_at_all_means_suppression_drifts() {
+        for landed in [(CENTRE.0 + 10, CENTRE.1), (CENTRE.0 + 90, CENTRE.1)] {
+            let shared = CaptureShared::new();
+            shared.set_remote(CENTRE);
+            assert!(shared.want_probe(CENTRE));
+            shared.note_pointer_location(landed.0, landed.1);
+            assert_eq!(shared.suppression(), Suppression::Drifts, "{landed:?}");
+        }
+    }
+
+    /// The anchor must be somewhere the pointer was *known* to be. Anchoring
+    /// on the previous event's coordinates instead looks right — until the
+    /// probe is not the first event of the hop, at which point a pinned
+    /// pointer sitting on the centre no longer matches the anchor and the
+    /// drifting rule gets latched on exactly the machines this exists for.
+    #[test]
+    fn the_anchor_is_the_centre_and_not_wherever_the_last_event_claimed() {
+        let shared = CaptureShared::new();
+        shared.set_remote(CENTRE);
+        // A couple of events have already gone by reporting motion.
+        shared.lx.store(CENTRE.0 + 30, Ordering::Relaxed);
+        shared.ly.store(CENTRE.1, Ordering::Relaxed);
+        assert!(shared.want_probe(CENTRE));
+        shared.note_pointer_location(CENTRE.0, CENTRE.1);
+        assert_eq!(shared.suppression(), Suppression::Pins);
+    }
+
+    #[test]
+    fn the_question_is_asked_once_and_then_never_again() {
+        let shared = CaptureShared::new();
+        shared.set_remote(CENTRE);
+        assert!(shared.want_probe(CENTRE));
+        assert!(!shared.want_probe(CENTRE), "one probe in flight at a time");
+        shared.note_pointer_location(CENTRE.0, CENTRE.1);
+        assert!(!shared.want_probe(CENTRE), "the answer does not expire");
+    }
+
+    /// A probe answered after the hop ended would be compared against an
+    /// anchor the pointer has since been warped away from, latching `Drifts`
+    /// on a machine that pins.
+    #[test]
+    fn an_answer_arriving_after_the_hop_ended_is_ignored() {
+        let shared = CaptureShared::new();
+        shared.set_remote(CENTRE);
+        assert!(shared.want_probe(CENTRE));
+        shared.set_local();
+        shared.note_pointer_location(1, 1);
+        assert_eq!(shared.suppression(), Suppression::Unknown);
+    }
+
+    /// Nothing can answer, so the question must not be left open: an
+    /// unanswered probe blocks every later one.
+    #[test]
+    fn without_an_injector_the_drifting_rule_is_settled_on() {
+        let shared = CaptureShared::new();
+        shared.injection_unavailable();
+        shared.set_remote(CENTRE);
+        assert_eq!(shared.suppression(), Suppression::Drifts);
+        assert!(!shared.want_probe(CENTRE));
     }
 }
