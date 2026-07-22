@@ -1,4 +1,5 @@
 /target
+.DS_Store
 daemon.err
 daemon.out
 probe.txt
