@@ -21,10 +21,19 @@
 //! Which one this machine does is settled by measurement, not by `cfg`: once a
 //! swallowed event reports a position away from the centre the hop warped the
 //! pointer to, the injector is asked where the pointer actually is. Still on
-//! that centre means suppression pins it; anywhere else means it drifts. The answer holds for the process lifetime,
-//! and until it arrives the drifting rule applies — the two agree on the first
-//! event after a hop, so the cost of guessing wrong for a millisecond is a
-//! couple of jittered events.
+//! that centre means suppression pins it; anywhere else means it drifts. The
+//! answer holds for the process lifetime, and until it arrives the drifting
+//! rule applies — the two agree on the first event after a hop, so the cost of
+//! guessing wrong for a millisecond is a couple of jittered events.
+//!
+//! That measurement only works if the pointer really is at the centre, which
+//! means the hop's warp must reach the OS. Our own warp is an injected move,
+//! and injected moves re-enter this very hook; swallowing it the way every
+//! other remote move is swallowed *blocks* it where suppression pins (Windows),
+//! so the pointer never leaves the edge it entered by and everything measured
+//! from the centre is measured from the wrong place. `warp_should_pass_through`
+//! lets a pending warp through instead — until the pointer is known to drift,
+//! where the warp lands regardless and swallowing resumes.
 //!
 //! While drifting, the pointer is warped back to the centre once it strays past
 //! a quarter of the way to an edge — so it cannot reach one and go silent, and
@@ -137,6 +146,25 @@ impl CaptureShared {
 
     fn suppression(&self) -> Suppression {
         Suppression::from_u8(self.suppression.load(Ordering::Relaxed))
+    }
+
+    /// Whether a move event should be passed to the OS rather than swallowed,
+    /// because it is (or coincides with) a warp we asked for and that warp has
+    /// to actually relocate the pointer.
+    ///
+    /// Every other remote move is swallowed. On a machine where swallowing
+    /// blocks the move outright (Windows), swallowing our *own* injected warp
+    /// freezes the pointer wherever it was — never reaching the centre the hop
+    /// warps it to — after which motion measured from that centre is nonsense
+    /// and the remote cursor is stuck by the edge it entered by. Letting the
+    /// warp through lands it. Where swallowing does not block the move (macOS,
+    /// X11) the warp lands regardless, so once that is known this stops and the
+    /// warp is swallowed like anything else, keeping stray physical moves off
+    /// the local screen. Until it is known, the warp is let through — harmless
+    /// where it would have landed anyway, and the one thing that works where it
+    /// would not.
+    fn warp_should_pass_through(&self) -> bool {
+        self.warp_pending.load(Ordering::Relaxed) && self.suppression() != Suppression::Drifts
     }
 
     /// Ask, once, where the pointer really is. `anchor` is the last position
@@ -341,6 +369,16 @@ fn callback(
         rdev::EventType::MouseMove { x, y } => {
             let (x, y) = (x as i32, y as i32);
             if remote {
+                // A warp we asked for must reach the OS or the pointer never
+                // moves to the centre; let it through untouched rather than
+                // swallowing it like every other remote move. The reference is
+                // resynced by the injector's `note_pointer_warped_to`, not
+                // here, so nothing to update. The window this is true for is a
+                // single synchronous hook call on Windows, so it does not leak
+                // physical moves onto the local screen.
+                if shared.warp_should_pass_through() {
+                    return Some(event);
+                }
                 let centre = (
                     shared.cx.load(Ordering::Relaxed),
                     shared.cy.load(Ordering::Relaxed),
@@ -525,7 +563,10 @@ mod tests {
             CENTRE,
             Suppression::Drifts,
         );
-        assert!(!m.implausible, "a fast hand must not be mistaken for a warp");
+        assert!(
+            !m.implausible,
+            "a fast hand must not be mistaken for a warp"
+        );
         assert_eq!(m.dx, BIGGEST_ALLOWED_STEP);
     }
 
@@ -582,7 +623,10 @@ mod tests {
             assert_eq!(m.dx, 10, "each event must report its own movement");
             travelled += m.dx;
         }
-        assert_eq!(travelled, 100, "100px of hand movement, not 10 then nothing");
+        assert_eq!(
+            travelled, 100,
+            "100px of hand movement, not 10 then nothing"
+        );
     }
 
     /// Nothing moved it, so there is nothing to move back — and warping would
@@ -683,5 +727,55 @@ mod tests {
         shared.set_remote(CENTRE);
         assert_eq!(shared.suppression(), Suppression::Drifts);
         assert!(!shared.want_probe(CENTRE));
+    }
+
+    /// The missing half of the fix: our own warp has to reach the OS. On a
+    /// machine that blocks a swallowed move it would otherwise be swallowed
+    /// like any other remote move, the pointer would never leave the edge for
+    /// the centre, and measuring from that centre would be measuring from a
+    /// place the pointer is not.
+    #[test]
+    fn a_pending_warp_is_let_through_until_the_pointer_is_known_to_drift() {
+        let shared = CaptureShared::new();
+        shared.set_remote(CENTRE);
+        // Hop just happened: a warp is in flight and nothing is measured yet.
+        assert_eq!(shared.suppression(), Suppression::Unknown);
+        assert!(
+            shared.warp_should_pass_through(),
+            "before the OS is known, the warp must be let through — harmless \
+             where it would land anyway, essential where it would not"
+        );
+    }
+
+    #[test]
+    fn a_pending_warp_is_let_through_on_a_pinning_machine() {
+        let shared = CaptureShared::new();
+        shared
+            .suppression
+            .store(Suppression::Pins as u8, Ordering::Relaxed);
+        shared.set_remote(CENTRE);
+        assert!(shared.warp_should_pass_through());
+    }
+
+    /// Where swallowing does not block the move, the warp lands regardless, so
+    /// it is swallowed like everything else — otherwise stray physical moves
+    /// during the warp would leak onto the local screen.
+    #[test]
+    fn a_pending_warp_is_swallowed_once_the_pointer_is_known_to_drift() {
+        let shared = CaptureShared::new();
+        shared
+            .suppression
+            .store(Suppression::Drifts as u8, Ordering::Relaxed);
+        shared.set_remote(CENTRE);
+        assert!(!shared.warp_should_pass_through());
+    }
+
+    #[test]
+    fn nothing_is_let_through_when_no_warp_is_pending() {
+        let shared = CaptureShared::new();
+        shared.set_remote(CENTRE);
+        shared.note_pointer_warped_to(CENTRE.0, CENTRE.1);
+        assert!(!shared.warp_pending.load(Ordering::Relaxed));
+        assert!(!shared.warp_should_pass_through());
     }
 }

@@ -110,7 +110,11 @@ releases.
   [capture.rs](crates/mousefinity/src/capture.rs) settles this per process by
   asking the injector where the pointer really is, and the anchor it compares
   against must be a position the pointer was *known* to occupy (the centre it
-  was warped to), never one a hook event merely reported.
+  was warped to), never one a hook event merely reported. That anchor only
+  holds if the hop's warp actually lands, and the warp is an injected move that
+  re-enters this same hook: swallowing it as if it were physical motion *blocks*
+  it where suppression pins, so `warp_should_pass_through` lets a pending warp
+  through to the OS until the pointer is known to drift.
 - **Which event was our own warp is not decided from coordinates.** A warp
   landing slightly off is indistinguishable from a fast flick; two attempts at
   telling them apart both leaked the teleport distance to the far screen as a
